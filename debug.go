@@ -168,7 +168,14 @@ func (l *State) errorMessage() {
 		l.top++
 		l.call(l.top-2, 1, false)
 	}
-	l.throw(RuntimeError(CheckString(l, -1)))
+	// In Lua 5.3, error() can be called with any value, not just strings.
+	// The actual error value stays on the stack and is used by setErrorObject.
+	// We only use the string representation for RuntimeError if available.
+	var msg string
+	if s, ok := l.stack[l.top-1].(string); ok {
+		msg = s
+	}
+	l.throw(RuntimeError(msg))
 }
 
 // SetDebugHook sets the debugging hook function.

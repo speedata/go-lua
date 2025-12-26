@@ -148,6 +148,8 @@ var tableLibrary = []RegistryFunction{
 	{"sort", func(l *State) int {
 		CheckType(l, 1, TypeTable)
 		n := LengthEx(l, 1)
+		// Lua 5.3: array too big check (n < INT_MAX, where INT_MAX is typically 2^31-1)
+		ArgumentCheck(l, n < (1<<31-1), 1, "array too big")
 		hasFunction := !l.IsNoneOrNil(2)
 		if hasFunction {
 			CheckType(l, 2, TypeFunction)
@@ -176,6 +178,8 @@ var tableLibrary = []RegistryFunction{
 		}
 		// Check for valid range
 		if e >= f {
+			// Check for "too many elements to move" (Lua 5.3: f > 0 || e < LUA_MAXINTEGER + f)
+			ArgumentCheck(l, f > 0 || e < maxInt+f, 3, "too many elements to move")
 			n := e - f + 1 // number of elements to move
 			ArgumentCheck(l, t <= maxInt-n+1, 4, "destination wrap around")
 			// Check if tables are the same (not just stack index, but actual identity)
