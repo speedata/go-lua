@@ -12,10 +12,17 @@ const (
 	tmAdd
 	tmSub
 	tmMul
-	tmDiv
-	tmMod
+	tmMod // Lua 5.3: MOD before POW
 	tmPow
+	tmDiv
+	tmIDiv // Lua 5.3: Integer division
+	tmBAnd // Lua 5.3: Bitwise AND
+	tmBOr  // Lua 5.3: Bitwise OR
+	tmBXor // Lua 5.3: Bitwise XOR
+	tmShl  // Lua 5.3: Shift left
+	tmShr  // Lua 5.3: Shift right
 	tmUnaryMinus
+	tmBNot // Lua 5.3: Bitwise NOT
 	tmLT
 	tmLE
 	tmConcat
@@ -33,10 +40,17 @@ var eventNames = []string{
 	"__add",
 	"__sub",
 	"__mul",
-	"__div",
 	"__mod",
 	"__pow",
+	"__div",
+	"__idiv",
+	"__band",
+	"__bor",
+	"__bxor",
+	"__shl",
+	"__shr",
 	"__unm",
+	"__bnot",
 	"__lt",
 	"__le",
 	"__concat",

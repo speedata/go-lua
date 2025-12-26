@@ -18,6 +18,9 @@ func (l *State) currentLine(ci *callInfo) int {
 }
 
 func chunkID(source string) string {
+	if len(source) == 0 {
+		return "[string \"?\"]"
+	}
 	switch source[0] {
 	case '=': // "literal" source
 		if len(source) <= idSize {
@@ -100,15 +103,48 @@ func (l *State) arithError(v1, v2 value) {
 	l.typeError(v2, "perform arithmetic on")
 }
 
+// bitwiseError reports an error for bitwise operations.
+// If either operand is a float that can't be converted to an integer,
+// it reports "number has no integer representation". Otherwise, it
+// falls back to standard arithmetic error.
+func (l *State) bitwiseError(v1, v2 value) {
+	// pow2_63 is 2^63 as float64, the boundary for valid int64 range
+	const pow2_63 = float64(1 << 63)
+	// Check if v1 is a float that can't be converted to integer
+	if f, ok := v1.(float64); ok {
+		// Check for out-of-range or non-integer
+		if f >= pow2_63 || f < -pow2_63 {
+			l.runtimeError("number has no integer representation")
+		}
+		if i := int64(f); float64(i) != f {
+			l.runtimeError("number has no integer representation")
+		}
+	}
+	// Check if v2 is a float that can't be converted to integer
+	if f, ok := v2.(float64); ok {
+		// Check for out-of-range or non-integer
+		if f >= pow2_63 || f < -pow2_63 {
+			l.runtimeError("number has no integer representation")
+		}
+		if i := int64(f); float64(i) != f {
+			l.runtimeError("number has no integer representation")
+		}
+	}
+	// Otherwise, fall back to standard arithmetic error (for non-numeric types)
+	l.arithError(v1, v2)
+}
+
 func (l *State) concatError(v1, v2 value) {
 	_, isString := v1.(string)
-	_, isNumber := v1.(float64)
-	if isString || isNumber {
+	_, isFloat := v1.(float64)
+	_, isInt := v1.(int64)
+	if isString || isFloat || isInt {
 		v1 = v2
 	}
 	_, isString = v1.(string)
-	_, isNumber = v1.(float64)
-	l.assert(!isString && !isNumber)
+	_, isFloat = v1.(float64)
+	_, isInt = v1.(int64)
+	l.assert(!isString && !isFloat && !isInt)
 	l.typeError(v1, "concatenate")
 }
 

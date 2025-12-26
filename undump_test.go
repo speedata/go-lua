@@ -15,12 +15,10 @@ func TestAllHeaderNoFun(t *testing.T) {
 }
 
 func TestWrongEndian(t *testing.T) {
+	// In Lua 5.3, endianness is checked via TestInt (0x5678)
 	h := header
-	if h.Endianness == 0 {
-		h.Endianness = 1
-	} else {
-		h.Endianness = 0
-	}
+	// Swap byte order of TestInt
+	h.TestInt = int64(0x7856000000000000)
 	expectErrorFromUndump(errIncompatible, h, t)
 }
 
@@ -36,9 +34,9 @@ func TestWrongNumberSize(t *testing.T) {
 	expectErrorFromUndump(errIncompatible, h, t)
 }
 
-func TestCorruptTail(t *testing.T) {
+func TestCorruptData(t *testing.T) {
 	h := header
-	h.Tail[3] += 1
+	h.Data[3] += 1
 	expectErrorFromUndump(errCorrupted, h, t)
 }
 

@@ -39,13 +39,21 @@ func (l *State) fastTagMethod(table *table, event tm) value {
 func (t *table) extendArray(last int) {
 	t.array = append(t.array, make([]value, last-len(t.array))...)
 	for k, v := range t.hash {
-		if f, ok := k.(float64); ok {
-			if i := int(f); float64(i) == f {
-				if 0 < i && i <= len(t.array) {
-					t.array[i-1] = v
-					delete(t.hash, k)
-				}
+		var i int
+		switch n := k.(type) {
+		case int64:
+			i = int(n)
+		case float64:
+			if float64(int(n)) != n {
+				continue
 			}
+			i = int(n)
+		default:
+			continue
+		}
+		if 0 < i && i <= len(t.array) {
+			t.array[i-1] = v
+			delete(t.hash, k)
 		}
 	}
 }
@@ -53,6 +61,10 @@ func (t *table) extendArray(last int) {
 func (t *table) atInt(k int) value {
 	if 0 < k && k <= len(t.array) {
 		return t.array[k-1]
+	}
+	// Try int64 key first (Lua 5.3 style), then float64 for backwards compat
+	if v := t.hash[int64(k)]; v != nil {
+		return v
 	}
 	return t.hash[float64(k)]
 }
@@ -66,10 +78,23 @@ func (t *table) maybeResizeArray(key int) bool {
 		}
 	}
 	for k, v := range t.hash {
-		if f, ok := k.(float64); ok && v != nil {
-			if i := int(f); i <= key && float64(i) == f {
-				occupancy++
+		if v == nil {
+			continue
+		}
+		var i int
+		switch n := k.(type) {
+		case int64:
+			i = int(n)
+		case float64:
+			if float64(int(n)) != n {
+				continue
 			}
+			i = int(n)
+		default:
+			continue
+		}
+		if i <= key {
+			occupancy++
 		}
 	}
 	if occupancy >= key>>1 {
@@ -92,9 +117,11 @@ func (t *table) putAtInt(k int, v value) {
 	} else if k > 0 && v != nil && t.maybeResizeArray(k) {
 		t.array[k-1] = v
 	} else if v == nil {
+		// Delete both int64 and float64 keys for backwards compat
+		delete(t.hash, int64(k))
 		delete(t.hash, float64(k))
 	} else {
-		t.addOrInsertHash(float64(k), v)
+		t.addOrInsertHash(int64(k), v)
 	}
 }
 
@@ -102,10 +129,24 @@ func (t *table) at(k value) value {
 	switch k := k.(type) {
 	case nil:
 		return nil
+	case int64:
+		i := int(k)
+		if 0 < i && i <= len(t.array) {
+			return t.array[i-1]
+		}
+		// Try int64 first, then float64 for backwards compat
+		if v := t.hash[k]; v != nil {
+			return v
+		}
+		return t.hash[float64(k)]
 	case float64:
 		if i := int(k); float64(i) == k { // OPT: Inlined copy of atInt.
 			if 0 < i && i <= len(t.array) {
 				return t.array[i-1]
+			}
+			// Try int64 first, then float64 for backwards compat
+			if v := t.hash[int64(i)]; v != nil {
+				return v
 			}
 			return t.hash[k]
 		}
@@ -119,6 +160,8 @@ func (t *table) put(l *State, k, v value) {
 	switch k := k.(type) {
 	case nil:
 		l.runtimeError("table index is nil")
+	case int64:
+		t.putAtInt(int(k), v)
 	case float64:
 		if i := int(k); float64(i) == k {
 			t.putAtInt(i, v)
@@ -148,6 +191,15 @@ func (t *table) put(l *State, k, v value) {
 func (t *table) tryPut(l *State, k, v value) bool {
 	switch k := k.(type) {
 	case nil:
+	case int64:
+		i := int(k)
+		if 0 < i && i <= len(t.array) && t.array[i-1] != nil {
+			t.array[i-1] = v
+			return true
+		} else if t.hash[k] != nil && v != nil {
+			t.hash[k] = v
+			return true
+		}
 	case float64:
 		if i := int(k); float64(i) == k && 0 < i && i <= len(t.array) && t.array[i-1] != nil {
 			t.array[i-1] = v
@@ -213,7 +265,10 @@ func (t *table) length() int {
 }
 
 func arrayIndex(k value) int {
-	if n, ok := k.(float64); ok {
+	switch n := k.(type) {
+	case int64:
+		return int(n)
+	case float64:
 		if i := int(n); float64(i) == n {
 			return i
 		}
@@ -233,7 +288,7 @@ func (l *State) next(t *table, key int) bool {
 	}
 	for ; i < len(t.array); i++ {
 		if t.array[i] != nil {
-			l.stack[key] = float64(i + 1)
+			l.stack[key] = int64(i + 1)
 			l.stack[key+1] = t.array[i]
 			return true
 		}

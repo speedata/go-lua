@@ -6,7 +6,8 @@ package lua
 // coroutine library), StringOpen (for the string library), TableOpen (for the
 // table library), MathOpen (for the mathematical library), Bit32Open (for the
 // bit library), IOOpen (for the I/O library), OSOpen (for the Operating System
-// library), and DebugOpen (for the debug library).
+// library), DebugOpen (for the debug library), and UTF8Open (for the UTF-8
+// library, new in Lua 5.3).
 //
 // The standard Lua libraries provide useful functions that are implemented
 // directly through the Go API. Some of these functions provide essential
@@ -40,6 +41,7 @@ func OpenLibraries(l *State, preloaded ...RegistryFunction) {
 		{"bit32", Bit32Open},
 		{"math", MathOpen},
 		{"debug", DebugOpen},
+		{"utf8", UTF8Open},
 	}
 	for _, lib := range libs {
 		Require(l, lib.Name, lib.Function, true)

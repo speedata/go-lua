@@ -1,3 +1,3 @@
-module github.com/Shopify/go-lua
+module github.com/speedata/go-lua
 
 go 1.22

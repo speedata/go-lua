@@ -44,8 +44,12 @@ const (
 	tkLE
 	tkNE
 	tkDoubleColon
+	tkIDiv // Lua 5.3: //
+	tkShl  // Lua 5.3: <<
+	tkShr  // Lua 5.3: >>
 	tkEOS
 	tkNumber
+	tkInteger // Lua 5.3: integer literal
 	tkName
 	tkString
 	reservedCount = tkWhile - firstReserved + 1
@@ -56,13 +60,16 @@ var tokens []string = []string{
 	"end", "false", "for", "function", "goto", "if",
 	"in", "local", "nil", "not", "or", "repeat",
 	"return", "then", "true", "until", "while",
-	"..", "...", "==", ">=", "<=", "~=", "::", "<eof>",
-	"<number>", "<name>", "<string>",
+	"..", "...", "==", ">=", "<=", "~=", "::",
+	"//", "<<", ">>", // Lua 5.3 operators
+	"<eof>",
+	"<number>", "<integer>", "<name>", "<string>",
 }
 
 type token struct {
 	t rune
 	n float64
+	i int64  // Lua 5.3: integer value
 	s string
 }
 
@@ -90,6 +97,8 @@ func (s *scanner) tokenToString(t rune) string {
 		return s.s
 	case t == tkNumber:
 		return fmt.Sprintf("%f", s.n)
+	case t == tkInteger:
+		return fmt.Sprintf("%d", s.i)
 	case t < firstReserved:
 		return string(t) // TODO check for printable rune
 	case t < tkEOS:
@@ -217,6 +226,7 @@ func (s *scanner) readHexNumber(x float64) (n float64, c rune, i int) {
 		return
 	}
 	for {
+		origC := c // Save original character before conversion
 		switch {
 		case '0' <= c && c <= '9':
 			c = c - '0'
@@ -227,13 +237,14 @@ func (s *scanner) readHexNumber(x float64) (n float64, c rune, i int) {
 		default:
 			return
 		}
+		s.save(origC) // Save hex digit for integer parsing
 		s.advance()
 		c, n, i = s.current, n*16.0+float64(c), i+1
 	}
 }
 
 func (s *scanner) readNumber() token {
-	const bits64, base10 = 64, 10
+	const bits64, base10, base16 = 64, 10, 16
 	c := s.current
 	s.assert(isDecimal(c))
 	s.saveAndAdvance()
@@ -242,8 +253,10 @@ func (s *scanner) readNumber() token {
 		s.assert(prefix == "0x" || prefix == "0X")
 		s.buffer.Reset()
 		var exponent int
+		isFloat := false
 		fraction, c, i := s.readHexNumber(0)
 		if c == '.' {
+			isFloat = true
 			s.advance()
 			fraction, c, exponent = s.readHexNumber(fraction)
 		}
@@ -252,6 +265,8 @@ func (s *scanner) readNumber() token {
 		}
 		exponent *= -4
 		if c == 'p' || c == 'P' {
+			isFloat = true
+			s.buffer.Reset() // Clear buffer before reading exponent
 			s.advance()
 			var negativeExponent bool
 			if c = s.current; c == '+' || c == '-' {
@@ -271,14 +286,40 @@ func (s *scanner) readNumber() token {
 			}
 			s.buffer.Reset()
 		}
+		// Lua 5.3: hex integer if no decimal point or exponent
+		if !isFloat && exponent == 0 {
+			hexStr := s.buffer.String()
+			s.buffer.Reset()
+			// Parse as unsigned with wrapping for values larger than 64 bits
+			// This matches Lua 5.3's behavior where overflow wraps around
+			var uintVal uint64
+			for _, c := range hexStr {
+				var digit uint64
+				switch {
+				case '0' <= c && c <= '9':
+					digit = uint64(c - '0')
+				case 'a' <= c && c <= 'f':
+					digit = uint64(c - 'a' + 10)
+				case 'A' <= c && c <= 'F':
+					digit = uint64(c - 'A' + 10)
+				}
+				uintVal = uintVal*16 + digit // naturally wraps on overflow
+			}
+			return token{t: tkInteger, i: int64(uintVal)}
+		}
+		s.buffer.Reset() // Clear buffer before returning hex float (e.g., 0x7.4)
 		return token{t: tkNumber, n: math.Ldexp(fraction, exponent)}
 	}
+	// Decimal number
+	isFloat := false
 	c = s.readDigits()
 	if c == '.' {
+		isFloat = true
 		s.saveAndAdvance()
 		c = s.readDigits()
 	}
 	if c == 'e' || c == 'E' {
+		isFloat = true
 		s.saveAndAdvance()
 		if c = s.current; c == '+' || c == '-' {
 			s.saveAndAdvance()
@@ -291,11 +332,18 @@ func (s *scanner) readNumber() token {
 			str = "0" + str
 		}
 	}
+	s.buffer.Reset()
+	// Lua 5.3: try to parse as integer if no decimal point or exponent
+	if !isFloat {
+		if intVal, err := strconv.ParseInt(str, base10, bits64); err == nil {
+			return token{t: tkInteger, i: intVal}
+		}
+		// Too large for int64, fall through to float
+	}
 	f, err := strconv.ParseFloat(str, bits64)
 	if err != nil {
 		s.numberError()
 	}
-	s.buffer.Reset()
 	return token{t: tkNumber, n: f}
 }
 
@@ -345,6 +393,75 @@ func (s *scanner) readDecimalEscape() (r rune) {
 	return
 }
 
+// readUnicodeEscape reads a \u{xxxx} Unicode escape sequence (Lua 5.3).
+// Returns the UTF-8 encoding of the codepoint.
+func (s *scanner) readUnicodeEscape() string {
+	s.advance() // skip 'u'
+	if s.current != '{' {
+		s.escapeError([]rune{'u', s.current}, "missing '{'")
+	}
+	s.advance() // skip '{'
+
+	var codepoint rune
+	digitCount := 0
+	for {
+		c := s.current
+		if c == '}' {
+			break
+		}
+		var digit rune
+		switch {
+		case '0' <= c && c <= '9':
+			digit = c - '0'
+		case 'a' <= c && c <= 'f':
+			digit = c - 'a' + 10
+		case 'A' <= c && c <= 'F':
+			digit = c - 'A' + 10
+		default:
+			s.escapeError([]rune{'u', '{'}, "hexadecimal digit expected")
+		}
+		codepoint = codepoint*16 + digit
+		digitCount++
+		if codepoint > 0x10FFFF {
+			s.escapeError([]rune{'u', '{'}, "UTF-8 value too large")
+		}
+		s.advance()
+	}
+	if digitCount == 0 {
+		s.escapeError([]rune{'u', '{'}, "hexadecimal digit expected")
+	}
+	s.advance() // skip '}'
+
+	// Encode codepoint as UTF-8
+	buf := make([]byte, 4)
+	n := encodeUTF8(buf, codepoint)
+	return string(buf[:n])
+}
+
+// encodeUTF8 encodes a rune as UTF-8 into buf and returns the number of bytes written.
+func encodeUTF8(buf []byte, r rune) int {
+	switch {
+	case r < 0x80:
+		buf[0] = byte(r)
+		return 1
+	case r < 0x800:
+		buf[0] = byte(0xC0 | (r >> 6))
+		buf[1] = byte(0x80 | (r & 0x3F))
+		return 2
+	case r < 0x10000:
+		buf[0] = byte(0xE0 | (r >> 12))
+		buf[1] = byte(0x80 | ((r >> 6) & 0x3F))
+		buf[2] = byte(0x80 | (r & 0x3F))
+		return 3
+	default:
+		buf[0] = byte(0xF0 | (r >> 18))
+		buf[1] = byte(0x80 | ((r >> 12) & 0x3F))
+		buf[2] = byte(0x80 | ((r >> 6) & 0x3F))
+		buf[3] = byte(0x80 | (r & 0x3F))
+		return 4
+	}
+}
+
 func (s *scanner) readString() token {
 	delimiter := s.current
 	for s.saveAndAdvance(); s.current != delimiter; {
@@ -365,6 +482,13 @@ func (s *scanner) readString() token {
 			case c == endOfStream: // do nothing
 			case c == 'x':
 				s.save(s.readHexEscape())
+			case c == 'u':
+				// Lua 5.3 Unicode escape \u{xxxx}
+				// Must iterate over bytes, not runes (range gives runes)
+				str := s.readUnicodeEscape()
+				for i := 0; i < len(str); i++ {
+					s.save(rune(str[i]))
+				}
 			case c == 'z':
 				for s.advance(); unicode.IsSpace(s.current); {
 					if isNewLine(s.current) {
@@ -417,6 +541,12 @@ func (s *scanner) scan() token {
 			s.incrementLineNumber()
 		case ' ', '\f', '\t', '\v':
 			s.advance()
+		case '/': // Lua 5.3: // for integer division
+			if s.advance(); s.current == '/' {
+				s.advance()
+				return token{t: tkIDiv}
+			}
+			return token{t: '/'}
 		case '-':
 			if s.advance(); s.current != '-' {
 				return token{t: '-'}
@@ -445,17 +575,25 @@ func (s *scanner) scan() token {
 			s.advance()
 			return token{t: tkEq}
 		case '<':
-			if s.advance(); s.current != '=' {
-				return token{t: '<'}
-			}
 			s.advance()
-			return token{t: tkLE}
+			if s.current == '=' {
+				s.advance()
+				return token{t: tkLE}
+			} else if s.current == '<' { // Lua 5.3: <<
+				s.advance()
+				return token{t: tkShl}
+			}
+			return token{t: '<'}
 		case '>':
-			if s.advance(); s.current != '=' {
-				return token{t: '>'}
-			}
 			s.advance()
-			return token{t: tkGE}
+			if s.current == '=' {
+				s.advance()
+				return token{t: tkGE}
+			} else if s.current == '>' { // Lua 5.3: >>
+				s.advance()
+				return token{t: tkShr}
+			}
+			return token{t: '>'}
 		case '~':
 			if s.advance(); s.current != '=' {
 				return token{t: '~'}

@@ -221,7 +221,12 @@ func Errorf(l *State, format string, a ...interface{}) {
 // calls the corresponding metamethod with the value as argument, and uses
 // the result of the call as its result.
 func ToStringMeta(l *State, index int) (string, bool) {
-	if !CallMeta(l, index, "__tostring") {
+	if CallMeta(l, index, "__tostring") {
+		// Lua 5.3: __tostring must return a string
+		if l.TypeOf(-1) != TypeString {
+			Errorf(l, "'__tostring' must return a string")
+		}
+	} else {
 		switch l.TypeOf(index) {
 		case TypeNumber, TypeString:
 			l.PushValue(index)
@@ -234,7 +239,15 @@ func ToStringMeta(l *State, index int) (string, bool) {
 		case TypeNil:
 			l.PushString("nil")
 		default:
-			l.PushFString("%s: %p", TypeNameOf(l, index), l.ToValue(index))
+			// Lua 5.3: Check for __name metatable entry first
+			typeName := TypeNameOf(l, index)
+			if MetaField(l, index, "__name") {
+				if name, ok := l.ToString(-1); ok {
+					typeName = name
+				}
+				l.Pop(1)
+			}
+			l.PushFString("%s: %p", typeName, l.ToValue(index))
 		}
 	}
 	return l.ToString(-1)
@@ -551,7 +564,7 @@ func LengthEx(l *State, index int) int {
 		l.Pop(1)
 		return length
 	}
-	Errorf(l, "object length is not a number")
+	Errorf(l, "object length is not an integer")
 	panic("unreachable")
 }
 

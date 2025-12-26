@@ -6,16 +6,113 @@ import (
 	"strings"
 )
 
+// numericValues extracts float64 values from two operands.
+// Handles both float64 and int64 types for Lua 5.3 compatibility.
+func numericValues(b, c value) (nb, nc float64, ok bool) {
+	nb, ok = toFloat(b)
+	if !ok {
+		return
+	}
+	nc, ok = toFloat(c)
+	return
+}
+
+// integerValues extracts int64 values from two operands.
+// Returns true only if BOTH operands are actual int64 values (not floats).
+// This matches Lua 5.3 semantics: float + float = float, even if values are integral.
+func integerValues(b, c value) (ib, ic int64, ok bool) {
+	ib, ok = b.(int64)
+	if !ok {
+		return
+	}
+	ic, ok = c.(int64)
+	return
+}
+
+// coerceToIntegers attempts to convert both operands to int64 for bitwise operations.
+// Floats with exact integer representations are converted. This matches Lua 5.3
+// bitwise operation semantics where floats can be coerced to integers.
+func coerceToIntegers(b, c value) (ib, ic int64, ok bool) {
+	ib, ok = toInteger(b)
+	if !ok {
+		return
+	}
+	ic, ok = toInteger(c)
+	return
+}
+
+// intIDiv performs integer floor division (Lua 5.3 // operator).
+// Returns floor(a/b), handling negative numbers correctly.
+func intIDiv(m, n int64) int64 {
+	if n == 0 {
+		return 0 // Lua returns nan for float, but we handle it here
+	}
+	q := m / n
+	// Adjust for floor division when signs differ
+	if (m^n) < 0 && m%n != 0 {
+		q--
+	}
+	return q
+}
+
+// intMod performs integer modulo (Lua 5.3 % operator).
+// Uses the definition: a % b == a - (a // b) * b
+func intMod(m, n int64) int64 {
+	if n == 0 {
+		return 0 // Avoid division by zero
+	}
+	return m - intIDiv(m, n)*n
+}
+
+// intShiftLeft performs a left shift operation.
+// If y is negative, performs right shift instead.
+// Lua 5.3 shift semantics: shifts >= 64 bits result in 0.
+func intShiftLeft(x, y int64) int64 {
+	if y >= 64 {
+		return 0
+	} else if y >= 0 {
+		return x << uint(y)
+	} else if y > -64 {
+		return int64(uint64(x) >> uint(-y))
+	}
+	return 0
+}
+
+// tmToOperator maps tagMethod to Operator for arithmetic operations
+var tmToOperator = map[tm]Operator{
+	tmAdd:        OpAdd,
+	tmSub:        OpSub,
+	tmMul:        OpMul,
+	tmDiv:        OpDiv,
+	tmMod:        OpMod,
+	tmPow:        OpPow,
+	tmUnaryMinus: OpUnaryMinus,
+}
+
 func (l *State) arith(rb, rc value, op tm) value {
 	if b, ok := l.toNumber(rb); ok {
 		if c, ok := l.toNumber(rc); ok {
-			return arith(Operator(op-tmAdd)+OpAdd, b, c)
+			if operator, ok := tmToOperator[op]; ok {
+				return arith(operator, b, c)
+			}
 		}
 	}
 	if result, ok := l.callBinaryTagMethod(rb, rc, op); ok {
 		return result
 	}
 	l.arithError(rb, rc)
+	return nil
+}
+
+// bitwiseArith handles bitwise operations, trying metamethods first before
+// producing the appropriate error message for non-integer floats.
+func (l *State) bitwiseArith(rb, rc value, op tm) value {
+	// Try metamethods first
+	if result, ok := l.callBinaryTagMethod(rb, rc, op); ok {
+		return result
+	}
+	// No metamethod - produce appropriate error
+	l.bitwiseError(rb, rc)
 	return nil
 }
 
@@ -103,14 +200,52 @@ func (l *State) equalObjects(t1, t2 value) bool {
 		if t1 == t2 {
 			return true
 		} else if t2, ok := t2.(*userData); ok {
-			tm = l.equalTagMethod(t1.metaTable, t2.metaTable, tmEq)
+			// Lua 5.3: try __eq from t1's metatable first, then t2's
+			tm = l.fastTagMethod(t1.metaTable, tmEq)
+			if tm == nil {
+				tm = l.fastTagMethod(t2.metaTable, tmEq)
+			}
 		}
 	case *table:
 		if t1 == t2 {
 			return true
 		} else if t2, ok := t2.(*table); ok {
-			tm = l.equalTagMethod(t1.metaTable, t2.metaTable, tmEq)
+			// Lua 5.3: try __eq from t1's metatable first, then t2's
+			tm = l.fastTagMethod(t1.metaTable, tmEq)
+			if tm == nil {
+				tm = l.fastTagMethod(t2.metaTable, tmEq)
+			}
 		}
+	case int64:
+		// Lua 5.3: compare int with float carefully to preserve precision
+		switch t2 := t2.(type) {
+		case int64:
+			return t1 == t2
+		case float64:
+			// Check if float has exact integer representation
+			if i2 := int64(t2); float64(i2) == t2 {
+				// Float is exact integer, compare as integers
+				return t1 == i2
+			}
+			// Float is not exact integer, convert int to float
+			return float64(t1) == t2
+		}
+		return false
+	case float64:
+		// Lua 5.3: compare float with int carefully to preserve precision
+		switch t2 := t2.(type) {
+		case float64:
+			return t1 == t2
+		case int64:
+			// Check if float has exact integer representation
+			if i1 := int64(t1); float64(i1) == t1 {
+				// Float is exact integer, compare as integers
+				return i1 == t2
+			}
+			// Float is not exact integer, convert int to float
+			return t1 == float64(t2)
+		}
+		return false
 	default:
 		return t1 == t2
 	}
@@ -134,11 +269,26 @@ func (l *State) callOrderTagMethod(left, right value, event tm) (bool, bool) {
 }
 
 func (l *State) lessThan(left, right value) bool {
-	if lf, ok := left.(float64); ok {
-		if rf, ok := right.(float64); ok {
-			return lf < rf
+	// Lua 5.3: compare numbers carefully to preserve precision
+	switch li := left.(type) {
+	case int64:
+		switch ri := right.(type) {
+		case int64:
+			return li < ri
+		case float64:
+			// Compare int < float
+			return intLessFloat(li, ri)
 		}
-	} else if ls, ok := left.(string); ok {
+	case float64:
+		switch ri := right.(type) {
+		case float64:
+			return li < ri
+		case int64:
+			// Compare float < int
+			return floatLessInt(li, ri)
+		}
+	}
+	if ls, ok := left.(string); ok {
 		if rs, ok := right.(string); ok {
 			return ls < rs
 		}
@@ -150,12 +300,86 @@ func (l *State) lessThan(left, right value) bool {
 	return false
 }
 
+// pow2_63 is 2^63, the boundary between int64 representable and not
+const pow2_63 float64 = 9223372036854775808.0 // 2^63
+
+// intLessFloat compares int64 < float64 with proper precision handling
+func intLessFloat(i int64, f float64) bool {
+	if math.IsNaN(f) {
+		return false // NaN comparisons always false
+	}
+	// Check if float is outside int64 range
+	if f >= pow2_63 { // f >= 2^63, definitely > any int64
+		return true
+	}
+	if f < float64(math.MinInt64) { // f < -2^63, definitely < any int64
+		return false
+	}
+	// Float is within int64 range
+	fi := int64(f)
+	if float64(fi) == f {
+		// Exact conversion
+		return i < fi
+	}
+	// Float is not exact integer, but within range
+	// f is between fi and fi+1 (for positive) or fi-1 and fi (for negative)
+	// i < f is true if i <= fi (since f > fi for positive fractional parts)
+	if f > 0 {
+		return i <= fi
+	}
+	// For negative non-integers, f is between fi-1 and fi
+	// i < f means i < fi (since f < fi)
+	return i < fi
+}
+
+// floatLessInt compares float64 < int64 with proper precision handling
+func floatLessInt(f float64, i int64) bool {
+	if math.IsNaN(f) {
+		return false // NaN comparisons always false
+	}
+	// Check if float is outside int64 range
+	if f >= pow2_63 { // f >= 2^63, definitely > any int64
+		return false
+	}
+	if f < float64(math.MinInt64) { // f < -2^63, definitely < any int64
+		return true
+	}
+	// Float is within int64 range
+	fi := int64(f)
+	if float64(fi) == f {
+		// Exact conversion
+		return fi < i
+	}
+	// Float is not exact integer
+	if f > 0 {
+		// f is between fi and fi+1
+		// f < i means fi+1 <= i, i.e., fi < i
+		return fi < i
+	}
+	// For negative non-integers, f is between fi-1 and fi
+	// f < i means fi <= i
+	return fi <= i
+}
+
 func (l *State) lessOrEqual(left, right value) bool {
-	if lf, ok := left.(float64); ok {
-		if rf, ok := right.(float64); ok {
-			return lf <= rf
+	// Lua 5.3: compare numbers carefully to preserve precision
+	switch li := left.(type) {
+	case int64:
+		switch ri := right.(type) {
+		case int64:
+			return li <= ri
+		case float64:
+			return intLessOrEqualFloat(li, ri)
 		}
-	} else if ls, ok := left.(string); ok {
+	case float64:
+		switch ri := right.(type) {
+		case float64:
+			return li <= ri
+		case int64:
+			return floatLessOrEqualInt(li, ri)
+		}
+	}
+	if ls, ok := left.(string); ok {
 		if rs, ok := right.(string); ok {
 			return ls <= rs
 		}
@@ -167,6 +391,64 @@ func (l *State) lessOrEqual(left, right value) bool {
 	}
 	l.orderError(left, right)
 	return false
+}
+
+// intLessOrEqualFloat compares int64 <= float64 with proper precision handling
+func intLessOrEqualFloat(i int64, f float64) bool {
+	if math.IsNaN(f) {
+		return false
+	}
+	// Check if float is outside int64 range
+	if f >= pow2_63 { // f >= 2^63, definitely > any int64
+		return true
+	}
+	if f < float64(math.MinInt64) { // f < -2^63, definitely < any int64
+		return false
+	}
+	// Float is within int64 range
+	fi := int64(f)
+	if float64(fi) == f {
+		// Exact conversion
+		return i <= fi
+	}
+	// Float is not exact integer
+	if f > 0 {
+		// f is between fi and fi+1
+		// i <= f means i <= fi (since fi < f)
+		return i <= fi
+	}
+	// For negative non-integers, f is between fi-1 and fi
+	// i <= f means i <= fi-1, i.e., i < fi
+	return i < fi
+}
+
+// floatLessOrEqualInt compares float64 <= int64 with proper precision handling
+func floatLessOrEqualInt(f float64, i int64) bool {
+	if math.IsNaN(f) {
+		return false
+	}
+	// Check if float is outside int64 range
+	if f >= pow2_63 { // f >= 2^63, definitely > any int64
+		return false
+	}
+	if f < float64(math.MinInt64) { // f < -2^63, definitely < any int64
+		return true
+	}
+	// Float is within int64 range
+	fi := int64(f)
+	if float64(fi) == f {
+		// Exact conversion
+		return fi <= i
+	}
+	// Float is not exact integer
+	if f > 0 {
+		// f is between fi and fi+1
+		// f <= i means fi+1 <= i, i.e., fi < i
+		return fi < i
+	}
+	// For negative non-integers, f is between fi-1 and fi
+	// f <= i means fi <= i
+	return fi <= i
 }
 
 func (l *State) concat(total int) {
@@ -185,6 +467,9 @@ func (l *State) concat(total int) {
 		s2, ok := t(2).(string)
 		if !ok {
 			_, ok = t(2).(float64)
+		}
+		if !ok {
+			_, ok = t(2).(int64)
 		}
 		if !ok {
 			concatTagMethod()
@@ -430,15 +715,22 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opAdd
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = nb + nc
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			// Try integer arithmetic first (Lua 5.3: int + int = int)
+			if ib, ic, ok := integerValues(b, c); ok {
+				e.frame[i.a()] = ib + ic
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = nb + nc
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
 			tmp := e.l.arith(b, c, tmAdd)
 			e.frame = e.callInfo.frame
@@ -452,15 +744,22 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opSub
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = nb - nc
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			// Try integer arithmetic first (Lua 5.3: int - int = int)
+			if ib, ic, ok := integerValues(b, c); ok {
+				e.frame[i.a()] = ib - ic
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = nb - nc
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
 			tmp := e.l.arith(b, c, tmSub)
 			e.frame = e.callInfo.frame
@@ -474,15 +773,22 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opMul
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = nb * nc
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			// Try integer arithmetic first (Lua 5.3: int * int = int)
+			if ib, ic, ok := integerValues(b, c); ok {
+				e.frame[i.a()] = ib * ic
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = nb * nc
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
 			tmp := e.l.arith(b, c, tmMul)
 			e.frame = e.callInfo.frame
@@ -493,40 +799,26 @@ func init() {
 			i = e.callInfo.step()
 			return jumpTable[i.opCode()], i
 		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opDiv
+		func(e *engine, i instruction) (engineOp, instruction) { // opMod (Lua 5.3: before POW)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = nb / nc
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			// Try integer arithmetic first (Lua 5.3: int % int = int)
+			if ib, ic, ok := integerValues(b, c); ok {
+				// Lua's modulo: a - (a // b) * b (handles negatives correctly)
+				e.frame[i.a()] = intMod(ib, ic)
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
-			tmp := e.l.arith(b, c, tmDiv)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opMod
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = math.Mod(nb, nc)
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = math.Mod(nb, nc)
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
 			tmp := e.l.arith(b, c, tmMod)
 			e.frame = e.callInfo.frame
@@ -540,15 +832,13 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opPow
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					e.frame[i.a()] = math.Pow(nb, nc)
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = math.Pow(nb, nc)
+				if e.hooked() {
+					e.hook()
 				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
 			}
 			tmp := e.l.arith(b, c, tmPow)
 			e.frame = e.callInfo.frame
@@ -559,15 +849,199 @@ func init() {
 			i = e.callInfo.step()
 			return jumpTable[i.opCode()], i
 		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opDiv (Lua 5.3: after POW)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = nb / nc
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.arith(b, c, tmDiv)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opIDiv (Lua 5.3: integer division)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := integerValues(b, c); ok {
+				// Check for division by zero
+				if ic == 0 {
+					e.l.runtimeError("attempt to divide by zero")
+				}
+				// Check for overflow: minint // -1 would overflow
+				if ib == math.MinInt64 && ic == -1 {
+					// Fall through to float division
+				} else {
+					e.frame[i.a()] = intIDiv(ib, ic)
+					if e.hooked() {
+						e.hook()
+					}
+					i = e.callInfo.step()
+					return jumpTable[i.opCode()], i
+				}
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				e.frame[i.a()] = math.Floor(nb / nc)
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.arith(b, c, tmIDiv)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opBAnd (Lua 5.3: bitwise AND)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				e.frame[i.a()] = ib & ic
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, c, tmBAnd)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opBOr (Lua 5.3: bitwise OR)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				e.frame[i.a()] = ib | ic
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, c, tmBOr)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opBXor (Lua 5.3: bitwise XOR)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				e.frame[i.a()] = ib ^ ic
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, c, tmBXor)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opShl (Lua 5.3: shift left)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				e.frame[i.a()] = intShiftLeft(ib, ic)
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, c, tmShl)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opShr (Lua 5.3: shift right)
+			b := e.k(i.b())
+			c := e.k(i.c())
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				e.frame[i.a()] = intShiftLeft(ib, -ic)
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, c, tmShr)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
 		func(e *engine, i instruction) (engineOp, instruction) { // opUnaryMinus
-			switch b := e.frame[i.b()].(type) {
-			case float64:
-				e.frame[i.a()] = -b
-			default:
+			b := e.frame[i.b()]
+			// Lua 5.3: preserve integer type unless overflow
+			if ib, ok := b.(int64); ok {
+				if ib == math.MinInt64 {
+					// -minint overflows, return float
+					e.frame[i.a()] = -float64(ib)
+				} else {
+					e.frame[i.a()] = -ib
+				}
+			} else if nb, ok := toFloat(b); ok {
+				e.frame[i.a()] = -nb
+			} else {
 				tmp := e.l.arith(b, b, tmUnaryMinus)
 				e.frame = e.callInfo.frame
 				e.frame[i.a()] = tmp
 			}
+			if e.hooked() {
+				e.hook()
+			}
+			i = e.callInfo.step()
+			return jumpTable[i.opCode()], i
+		},
+		func(e *engine, i instruction) (engineOp, instruction) { // opBNot (Lua 5.3: bitwise NOT)
+			b := e.frame[i.b()]
+			if ib, ok := toInteger(b); ok {
+				e.frame[i.a()] = ^ib
+				if e.hooked() {
+					e.hook()
+				}
+				i = e.callInfo.step()
+				return jumpTable[i.opCode()], i
+			}
+			tmp := e.l.bitwiseArith(b, b, tmBNot)
+			e.frame = e.callInfo.frame
+			e.frame[i.a()] = tmp
 			if e.hooked() {
 				e.hook()
 			}
@@ -798,11 +1272,25 @@ func init() {
 		},
 		func(e *engine, i instruction) (engineOp, instruction) { // opForLoop
 			a := i.a()
-			index, limit, step := e.frame[a+0].(float64), e.frame[a+1].(float64), e.frame[a+2].(float64)
-			if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
-				e.callInfo.jump(i.sbx())
-				e.frame[a+0] = index // update internal index...
-				e.frame[a+3] = index // ... and external index
+			// Check if this is an integer loop or float loop
+			if iIndex, ok := e.frame[a+0].(int64); ok {
+				// Integer loop
+				iStep := e.frame[a+2].(int64)
+				iLimit := e.frame[a+1].(int64)
+				iIndex += iStep
+				if (0 < iStep && iIndex <= iLimit) || (iStep <= 0 && iLimit <= iIndex) {
+					e.callInfo.jump(i.sbx())
+					e.frame[a+0] = iIndex // update internal index...
+					e.frame[a+3] = iIndex // ... and external index
+				}
+			} else {
+				// Float loop
+				index, limit, step := e.frame[a+0].(float64), e.frame[a+1].(float64), e.frame[a+2].(float64)
+				if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
+					e.callInfo.jump(i.sbx())
+					e.frame[a+0] = index // update internal index...
+					e.frame[a+3] = index // ... and external index
+				}
 			}
 			if e.hooked() {
 				e.hook()
@@ -812,6 +1300,25 @@ func init() {
 		},
 		func(e *engine, i instruction) (engineOp, instruction) { // opForPrep
 			a := i.a()
+			// Try integer loop first: if init and step are integers, and limit can be integer
+			if iInit, initOk := e.frame[a+0].(int64); initOk {
+				if iStep, stepOk := e.frame[a+2].(int64); stepOk {
+					// Try to convert limit to integer
+					if iLimit, limitOk := forLimit(e.frame[a+1], iStep); limitOk {
+						// All values are integers - use integer loop
+						e.frame[a+0] = iInit - iStep
+						e.frame[a+1] = iLimit
+						// e.frame[a+2] is already iStep
+						e.callInfo.jump(i.sbx())
+						if e.hooked() {
+							e.hook()
+						}
+						i = e.callInfo.step()
+						return jumpTable[i.opCode()], i
+					}
+				}
+			}
+			// Fall back to float loop
 			if init, ok := e.l.toNumber(e.frame[a+0]); !ok {
 				e.l.runtimeError("'for' initial value must be a number")
 			} else if limit, ok := e.l.toNumber(e.frame[a+1]); !ok {
@@ -1027,11 +1534,9 @@ func (l *State) executeSwitch() {
 		case opAdd:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = nb + nc
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb + nc
+				break
 			}
 			tmp := l.arith(b, c, tmAdd)
 			frame = ci.frame
@@ -1039,11 +1544,9 @@ func (l *State) executeSwitch() {
 		case opSub:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = nb - nc
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb - nc
+				break
 			}
 			tmp := l.arith(b, c, tmSub)
 			frame = ci.frame
@@ -1051,11 +1554,9 @@ func (l *State) executeSwitch() {
 		case opMul:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = nb * nc
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb * nc
+				break
 			}
 			tmp := l.arith(b, c, tmMul)
 			frame = ci.frame
@@ -1063,11 +1564,9 @@ func (l *State) executeSwitch() {
 		case opDiv:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = nb / nc
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb / nc
+				break
 			}
 			tmp := l.arith(b, c, tmDiv)
 			frame = ci.frame
@@ -1075,11 +1574,9 @@ func (l *State) executeSwitch() {
 		case opMod:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = math.Mod(nb, nc)
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = math.Mod(nb, nc)
+				break
 			}
 			tmp := l.arith(b, c, tmMod)
 			frame = ci.frame
@@ -1087,24 +1584,111 @@ func (l *State) executeSwitch() {
 		case opPow:
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if nb, ok := b.(float64); ok {
-				if nc, ok := c.(float64); ok {
-					frame[i.a()] = math.Pow(nb, nc)
-					break
-				}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = math.Pow(nb, nc)
+				break
 			}
 			tmp := l.arith(b, c, tmPow)
 			frame = ci.frame
 			frame[i.a()] = tmp
+		case opIDiv: // Lua 5.3: integer division
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := integerValues(b, c); ok {
+				// Check for division by zero
+				if ic == 0 {
+					l.runtimeError("attempt to divide by zero")
+				}
+				// Check for overflow: minint // -1 would overflow
+				if ib != math.MinInt64 || ic != -1 {
+					frame[i.a()] = intIDiv(ib, ic)
+					break
+				}
+				// Fall through to float division
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = math.Floor(nb / nc)
+				break
+			}
+			tmp := l.arith(b, c, tmIDiv)
+			frame = ci.frame
+			frame[i.a()] = tmp
+		case opBAnd: // Lua 5.3: bitwise AND
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				frame[i.a()] = ib & ic
+				break
+			}
+			tmp := l.bitwiseArith(b, c, tmBAnd)
+			frame = ci.frame
+			frame[i.a()] = tmp
+		case opBOr: // Lua 5.3: bitwise OR
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				frame[i.a()] = ib | ic
+				break
+			}
+			tmp := l.bitwiseArith(b, c, tmBOr)
+			frame = ci.frame
+			frame[i.a()] = tmp
+		case opBXor: // Lua 5.3: bitwise XOR
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				frame[i.a()] = ib ^ ic
+				break
+			}
+			tmp := l.bitwiseArith(b, c, tmBXor)
+			frame = ci.frame
+			frame[i.a()] = tmp
+		case opShl: // Lua 5.3: shift left
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				frame[i.a()] = intShiftLeft(ib, ic)
+				break
+			}
+			tmp := l.bitwiseArith(b, c, tmShl)
+			frame = ci.frame
+			frame[i.a()] = tmp
+		case opShr: // Lua 5.3: shift right
+			b := k(i.b(), constants, frame)
+			c := k(i.c(), constants, frame)
+			if ib, ic, ok := coerceToIntegers(b, c); ok {
+				frame[i.a()] = intShiftLeft(ib, -ic)
+				break
+			}
+			tmp := l.bitwiseArith(b, c, tmShr)
+			frame = ci.frame
+			frame[i.a()] = tmp
 		case opUnaryMinus:
-			switch b := frame[i.b()].(type) {
-			case float64:
-				frame[i.a()] = -b
-			default:
+			b := frame[i.b()]
+			// Lua 5.3: preserve integer type unless overflow
+			if ib, ok := b.(int64); ok {
+				if ib == math.MinInt64 {
+					// -minint overflows, return float
+					frame[i.a()] = -float64(ib)
+				} else {
+					frame[i.a()] = -ib
+				}
+			} else if nb, ok := toFloat(b); ok {
+				frame[i.a()] = -nb
+			} else {
 				tmp := l.arith(b, b, tmUnaryMinus)
 				frame = ci.frame
 				frame[i.a()] = tmp
 			}
+		case opBNot: // Lua 5.3: bitwise NOT
+			b := frame[i.b()]
+			if ib, ok := toInteger(b); ok {
+				frame[i.a()] = ^ib
+				break
+			}
+			tmp := l.bitwiseArith(b, b, tmBNot)
+			frame = ci.frame
+			frame[i.a()] = tmp
 		case opNot:
 			frame[i.a()] = isFalse(frame[i.b()])
 		case opLength:
@@ -1254,14 +1838,43 @@ func (l *State) executeSwitch() {
 			frame, closure, constants = newFrame(l, ci)
 		case opForLoop:
 			a := i.a()
-			index, limit, step := frame[a+0].(float64), frame[a+1].(float64), frame[a+2].(float64)
-			if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
-				ci.jump(i.sbx())
-				frame[a+0] = index // update internal index...
-				frame[a+3] = index // ... and external index
+			// Check if this is an integer loop or float loop
+			if iIndex, ok := frame[a+0].(int64); ok {
+				// Integer loop
+				iStep := frame[a+2].(int64)
+				iLimit := frame[a+1].(int64)
+				iIndex += iStep
+				if (0 < iStep && iIndex <= iLimit) || (iStep <= 0 && iLimit <= iIndex) {
+					ci.jump(i.sbx())
+					frame[a+0] = iIndex // update internal index...
+					frame[a+3] = iIndex // ... and external index
+				}
+			} else {
+				// Float loop
+				index, limit, step := frame[a+0].(float64), frame[a+1].(float64), frame[a+2].(float64)
+				if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
+					ci.jump(i.sbx())
+					frame[a+0] = index // update internal index...
+					frame[a+3] = index // ... and external index
+				}
 			}
 		case opForPrep:
 			a := i.a()
+			// Try integer loop first: if init and step are integers, and limit can be integer
+			if iInit, initOk := frame[a+0].(int64); initOk {
+				if iStep, stepOk := frame[a+2].(int64); stepOk {
+					// Try to convert limit to integer
+					if iLimit, limitOk := forLimit(frame[a+1], iStep); limitOk {
+						// All values are integers - use integer loop
+						frame[a+0] = iInit - iStep
+						frame[a+1] = iLimit
+						// frame[a+2] is already iStep
+						ci.jump(i.sbx())
+						break
+					}
+				}
+			}
+			// Fall back to float loop
 			if init, ok := l.toNumber(frame[a+0]); !ok {
 				l.runtimeError("'for' initial value must be a number")
 			} else if limit, ok := l.toNumber(frame[a+1]); !ok {

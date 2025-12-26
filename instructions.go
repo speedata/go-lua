@@ -28,10 +28,17 @@ const (
 	opAdd
 	opSub
 	opMul
-	opDiv
-	opMod
+	opMod  // Lua 5.3: MOD before POW
 	opPow
+	opDiv
+	opIDiv // Lua 5.3: Integer division //
+	opBAnd // Lua 5.3: Bitwise AND &
+	opBOr  // Lua 5.3: Bitwise OR |
+	opBXor // Lua 5.3: Bitwise XOR ~
+	opShl  // Lua 5.3: Shift left <<
+	opShr  // Lua 5.3: Shift right >>
 	opUnaryMinus
+	opBNot // Lua 5.3: Bitwise NOT ~
 	opNot
 	opLength
 	opConcat
@@ -71,10 +78,17 @@ var opNames = []string{
 	"ADD",
 	"SUB",
 	"MUL",
-	"DIV",
 	"MOD",
 	"POW",
+	"DIV",
+	"IDIV",
+	"BAND",
+	"BOR",
+	"BXOR",
+	"SHL",
+	"SHR",
 	"UNM",
+	"BNOT",
 	"NOT",
 	"LEN",
 	"CONCAT",
@@ -242,10 +256,17 @@ var opModes []byte = []byte{
 	opmode(0, 1, opArgK, opArgK, iABC),  // opAdd
 	opmode(0, 1, opArgK, opArgK, iABC),  // opSub
 	opmode(0, 1, opArgK, opArgK, iABC),  // opMul
-	opmode(0, 1, opArgK, opArgK, iABC),  // opDiv
 	opmode(0, 1, opArgK, opArgK, iABC),  // opMod
 	opmode(0, 1, opArgK, opArgK, iABC),  // opPow
+	opmode(0, 1, opArgK, opArgK, iABC),  // opDiv
+	opmode(0, 1, opArgK, opArgK, iABC),  // opIDiv
+	opmode(0, 1, opArgK, opArgK, iABC),  // opBAnd
+	opmode(0, 1, opArgK, opArgK, iABC),  // opBOr
+	opmode(0, 1, opArgK, opArgK, iABC),  // opBXor
+	opmode(0, 1, opArgK, opArgK, iABC),  // opShl
+	opmode(0, 1, opArgK, opArgK, iABC),  // opShr
 	opmode(0, 1, opArgR, opArgN, iABC),  // opUnaryMinus
+	opmode(0, 1, opArgR, opArgN, iABC),  // opBNot
 	opmode(0, 1, opArgR, opArgN, iABC),  // opNot
 	opmode(0, 1, opArgR, opArgN, iABC),  // opLength
 	opmode(0, 1, opArgR, opArgR, iABC),  // opConcat

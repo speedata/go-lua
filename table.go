@@ -161,6 +161,53 @@ var tableLibrary = []RegistryFunction{
 		}
 		return 0
 	}},
+	// Lua 5.3: table.move
+	{"move", func(l *State) int {
+		CheckType(l, 1, TypeTable)
+		f := CheckInteger(l, 2)
+		e := CheckInteger(l, 3)
+		t := CheckInteger(l, 4)
+		var tt int // destination table stack index
+		if !l.IsNoneOrNil(5) {
+			CheckType(l, 5, TypeTable)
+			tt = 5
+		} else {
+			tt = 1 // default: same table
+		}
+		// Check for valid range
+		if e >= f {
+			n := e - f + 1 // number of elements to move
+			ArgumentCheck(l, t <= maxInt-n+1, 4, "destination wrap around")
+			// Check if tables are the same (not just stack index, but actual identity)
+			sameTable := l.RawEqual(1, tt)
+			// Helper to get value respecting __index
+			getVal := func(idx int) {
+				l.PushInteger(idx)
+				l.Table(1) // pops key, pushes value
+			}
+			// Helper to set value respecting __newindex
+			setVal := func(idx int) {
+				l.PushInteger(idx)
+				l.Insert(-2) // key before value
+				l.SetTable(tt) // pops key and value
+			}
+			if t > e || t <= f || !sameTable {
+				// Non-overlapping or different tables: copy forward
+				for i := 0; i < n; i++ {
+					getVal(f + i)
+					setVal(t + i)
+				}
+			} else {
+				// Overlapping, destination after source in same table: copy backward
+				for i := n - 1; i >= 0; i-- {
+					getVal(f + i)
+					setVal(t + i)
+				}
+			}
+		}
+		l.PushValue(tt)
+		return 1
+	}},
 }
 
 // TableOpen opens the table library. Usually passed to Require.

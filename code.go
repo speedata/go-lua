@@ -7,6 +7,7 @@ import (
 
 const (
 	oprMinus = iota
+	oprBNot // Lua 5.3: bitwise NOT ~
 	oprNot
 	oprLength
 	oprNoUnary
@@ -22,9 +23,15 @@ const (
 	oprAdd = iota
 	oprSub
 	oprMul
-	oprDiv
-	oprMod
+	oprMod // Lua 5.3: MOD before DIV
 	oprPow
+	oprDiv
+	oprIDiv  // Lua 5.3: integer division //
+	oprBAnd  // Lua 5.3: bitwise AND &
+	oprBOr   // Lua 5.3: bitwise OR |
+	oprBXor  // Lua 5.3: bitwise XOR ~
+	oprShl   // Lua 5.3: shift left <<
+	oprShr   // Lua 5.3: shift right >>
 	oprConcat
 	oprEq
 	oprLT
@@ -44,6 +51,7 @@ const (
 	kindFalse
 	kindConstant       // info = index of constant
 	kindNumber         // value = numerical value
+	kindInteger        // ivalue = integer value (Lua 5.3)
 	kindNonRelocatable // info = result register
 	kindLocal          // info = local register
 	kindUpValue        // info = index of upvalue
@@ -61,6 +69,7 @@ var kinds []string = []string{
 	"false",
 	"constant",
 	"number",
+	"integer",
 	"nonrelocatable",
 	"local",
 	"upvalue",
@@ -77,8 +86,9 @@ type exprDesc struct {
 	table     int // register or upvalue
 	tableType int // whether 'table' is register (kindLocal) or upvalue (kindUpValue)
 	info      int
-	t, f      int // patch lists for 'exit when true/false'
-	value     float64
+	t, f      int     // patch lists for 'exit when true/false'
+	value     float64 // for kindNumber
+	ivalue    int64   // for kindInteger (Lua 5.3)
 }
 
 type assignmentTarget struct {
@@ -172,6 +182,9 @@ func (f *function) MakeGoto(name string, line, pc int) {
 }
 
 func (f *function) MakeLabel(name string, line int) int {
+	// Mark current position as a jump target to prevent LOADNIL optimization
+	// from merging across labels (bug fix for 5.2 -> 5.3.2)
+	f.lastTarget = len(f.f.code)
 	f.p.activeLabels = append(f.p.activeLabels, label{name: name, line: line, pc: len(f.f.code), activeVariableCount: f.activeVariableCount})
 	return len(f.p.activeLabels) - 1
 }
@@ -293,7 +306,7 @@ func (f *function) unreachable()                        { f.assert(false) }
 func (f *function) assert(cond bool)                    { f.p.l.assert(cond) }
 func (f *function) Instruction(e exprDesc) *instruction { return &f.f.code[e.info] }
 func (e exprDesc) hasJumps() bool                       { return e.t != e.f }
-func (e exprDesc) isNumeral() bool                      { return e.kind == kindNumber && e.t == noJump && e.f == noJump }
+func (e exprDesc) isNumeral() bool                      { return (e.kind == kindNumber || e.kind == kindInteger) && e.t == noJump && e.f == noJump }
 func (e exprDesc) isVariable() bool                     { return kindLocal <= e.kind && e.kind <= kindIndexed }
 func (e exprDesc) hasMultipleReturns() bool             { return e.kind == kindCall || e.kind == kindVarArg }
 
@@ -544,6 +557,13 @@ func (f *function) NumberConstant(n float64) int {
 	return f.addConstant(n, n)
 }
 
+// IntegerConstant adds an integer constant to the constant table (Lua 5.3)
+func (f *function) IntegerConstant(n int64) int {
+	// Use a distinct key type to differentiate int64 from float64
+	type intKey struct{ v int64 }
+	return f.addConstant(intKey{n}, n)
+}
+
 func (f *function) CheckStack(n int) {
 	if n += f.freeRegisterCount; n >= maxStack {
 		f.p.syntaxError("function or expression too complex")
@@ -625,6 +645,8 @@ func (f *function) dischargeToRegister(e exprDesc, r int) exprDesc {
 		f.EncodeConstant(r, e.info)
 	case kindNumber:
 		f.EncodeConstant(r, f.NumberConstant(e.value))
+	case kindInteger:
+		f.EncodeConstant(r, f.IntegerConstant(e.ivalue))
 	case kindRelocatable:
 		f.Instruction(e).setA(r)
 	case kindNonRelocatable:
@@ -722,6 +744,11 @@ func (f *function) expressionToRegisterOrConstant(e exprDesc) (exprDesc, int) {
 	case kindNumber:
 		e.info, e.kind = f.NumberConstant(e.value), kindConstant
 		fallthrough
+	case kindInteger:
+		if e.kind == kindInteger {
+			e.info, e.kind = f.IntegerConstant(e.ivalue), kindConstant
+		}
+		fallthrough
 	case kindConstant:
 		if e.info <= maxIndexRK {
 			return e, asConstant(e.info)
@@ -790,7 +817,7 @@ func (f *function) GoIfTrue(e exprDesc) exprDesc {
 	case kindJump:
 		f.invertJump(e.info)
 		pc = e.info
-	case kindConstant, kindNumber, kindTrue:
+	case kindConstant, kindNumber, kindInteger, kindTrue:
 	default:
 		pc = f.jumpOnCondition(e, 0)
 	}
@@ -819,7 +846,7 @@ func (f *function) encodeNot(e exprDesc) exprDesc {
 	switch e = f.DischargeVariables(e); e.kind {
 	case kindNil, kindFalse:
 		e.kind = kindTrue
-	case kindConstant, kindNumber, kindTrue:
+	case kindConstant, kindNumber, kindInteger, kindTrue:
 		e.kind = kindFalse
 	case kindJump:
 		f.invertJump(e.info)
@@ -853,10 +880,71 @@ func (f *function) Indexed(t, k exprDesc) (r exprDesc) {
 func foldConstants(op opCode, e1, e2 exprDesc) (exprDesc, bool) {
 	if !e1.isNumeral() || !e2.isNumeral() {
 		return e1, false
-	} else if (op == opDiv || op == opMod) && e2.value == 0.0 {
+	}
+	// Don't fold bitwise or integer division operations (they need integer semantics)
+	switch op {
+	case opIDiv, opBAnd, opBOr, opBXor, opShl, opShr, opBNot:
 		return e1, false
 	}
-	e1.value = arith(Operator(op-opAdd)+OpAdd, e1.value, e2.value)
+
+	// Get the numeric values from the appropriate fields
+	var v1, v2 float64
+	if e1.kind == kindInteger {
+		v1 = float64(e1.ivalue)
+	} else {
+		v1 = e1.value
+	}
+	if e2.kind == kindInteger {
+		v2 = float64(e2.ivalue)
+	} else {
+		v2 = e2.value
+	}
+
+	// Check for division by zero
+	switch op {
+	case opDiv, opMod:
+		if v2 == 0.0 {
+			return e1, false
+		}
+	}
+
+	// Map opcode to Operator for arith()
+	var arithOp Operator
+	switch op {
+	case opAdd:
+		arithOp = OpAdd
+	case opSub:
+		arithOp = OpSub
+	case opMul:
+		arithOp = OpMul
+	case opMod:
+		arithOp = OpMod
+	case opPow:
+		arithOp = OpPow
+	case opDiv:
+		arithOp = OpDiv
+	case opUnaryMinus:
+		arithOp = OpUnaryMinus
+	default:
+		return e1, false
+	}
+
+	result := arith(arithOp, v1, v2)
+
+	// Determine result type: integer if both inputs are integers and result fits
+	// Division and power always produce floats
+	if e1.kind == kindInteger && e2.kind == kindInteger && op != opDiv && op != opPow {
+		// Check if result can be represented as an exact integer
+		if i := int64(result); float64(i) == result {
+			e1.kind = kindInteger
+			e1.ivalue = i
+			return e1, true
+		}
+	}
+
+	// Otherwise return as float
+	e1.kind = kindNumber
+	e1.value = result
 	return e1, true
 }
 
@@ -865,7 +953,7 @@ func (f *function) encodeArithmetic(op opCode, e1, e2 exprDesc, line int) exprDe
 		return e
 	}
 	o2 := 0
-	if op != opUnaryMinus && op != opLength {
+	if op != opUnaryMinus && op != opLength && op != opBNot {
 		e2, o2 = f.expressionToRegisterOrConstant(e2)
 	}
 	e1, o1 := f.expressionToRegisterOrConstant(e1)
@@ -885,10 +973,16 @@ func (f *function) Prefix(op int, e exprDesc, line int) exprDesc {
 	switch op {
 	case oprMinus:
 		if e.isNumeral() {
-			e.value = -e.value
+			if e.kind == kindInteger {
+				e.ivalue = -e.ivalue
+			} else {
+				e.value = -e.value
+			}
 			return e
 		}
 		return f.encodeArithmetic(opUnaryMinus, f.ExpressionToAnyRegister(e), makeExpression(kindNumber, 0), line)
+	case oprBNot: // Lua 5.3: bitwise NOT
+		return f.encodeArithmetic(opBNot, f.ExpressionToAnyRegister(e), makeExpression(kindNumber, 0), line)
 	case oprNot:
 		return f.encodeNot(e)
 	case oprLength:
@@ -905,10 +999,13 @@ func (f *function) Infix(op int, e exprDesc) exprDesc {
 		e = f.GoIfFalse(e)
 	case oprConcat:
 		e = f.ExpressionToNextRegister(e)
-	case oprAdd, oprSub, oprMul, oprDiv, oprMod, oprPow:
+	case oprAdd, oprSub, oprMul, oprDiv, oprMod, oprPow, oprIDiv:
 		if !e.isNumeral() {
 			e, _ = f.expressionToRegisterOrConstant(e)
 		}
+	case oprBAnd, oprBOr, oprBXor, oprShl, oprShr:
+		// Lua 5.3: bitwise operators
+		e, _ = f.expressionToRegisterOrConstant(e)
 	default:
 		e, _ = f.expressionToRegisterOrConstant(e)
 	}
@@ -946,8 +1043,26 @@ func (f *function) Postfix(op int, e1, e2 exprDesc, line int) exprDesc {
 			return makeExpression(kindRelocatable, e2.info)
 		}
 		return f.encodeArithmetic(opConcat, e1, f.ExpressionToNextRegister(e2), line)
-	case oprAdd, oprSub, oprMul, oprDiv, oprMod, oprPow:
+	case oprAdd, oprSub, oprMul:
 		return f.encodeArithmetic(opCode(op-oprAdd)+opAdd, e1, e2, line)
+	case oprMod:
+		return f.encodeArithmetic(opMod, e1, e2, line)
+	case oprPow:
+		return f.encodeArithmetic(opPow, e1, e2, line)
+	case oprDiv:
+		return f.encodeArithmetic(opDiv, e1, e2, line)
+	case oprIDiv: // Lua 5.3: integer division
+		return f.encodeArithmetic(opIDiv, e1, e2, line)
+	case oprBAnd: // Lua 5.3: bitwise AND
+		return f.encodeArithmetic(opBAnd, e1, e2, line)
+	case oprBOr: // Lua 5.3: bitwise OR
+		return f.encodeArithmetic(opBOr, e1, e2, line)
+	case oprBXor: // Lua 5.3: bitwise XOR
+		return f.encodeArithmetic(opBXor, e1, e2, line)
+	case oprShl: // Lua 5.3: shift left
+		return f.encodeArithmetic(opShl, e1, e2, line)
+	case oprShr: // Lua 5.3: shift right
+		return f.encodeArithmetic(opShr, e1, e2, line)
 	case oprEq, oprLT, oprLE:
 		return f.encodeComparison(opCode(op-oprEq)+opEqual, 1, e1, e2)
 	case oprNE, oprGT, oprGE:

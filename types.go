@@ -33,6 +33,8 @@ func debugValue(v value) string {
 		return "'" + v + "'"
 	case float64:
 		return fmt.Sprintf("%f", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
 	case *luaClosure:
 		return fmt.Sprintf("closure %s:%d %v", v.prototype.source, v.prototype.lineDefined, v)
 	case *goClosure:
@@ -66,6 +68,117 @@ func isFalse(s value) bool {
 	}
 	b, isBool := s.(bool)
 	return isBool && !b
+}
+
+// isInteger returns true if the value is a Lua integer (int64).
+func isInteger(v value) bool {
+	_, ok := v.(int64)
+	return ok
+}
+
+// isFloat returns true if the value is a Lua float (float64).
+func isFloat(v value) bool {
+	_, ok := v.(float64)
+	return ok
+}
+
+// isNumber returns true if the value is a Lua number (int64 or float64).
+func isNumber(v value) bool {
+	switch v.(type) {
+	case int64, float64:
+		return true
+	}
+	return false
+}
+
+// toFloat converts a numeric value to float64.
+// Returns the float value and true if successful.
+func toFloat(v value) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// pow2_63 is 2^63 as float64, used for range checks.
+// This is the smallest float64 that cannot be represented as int64.
+const pow2_63Float = float64(1 << 63) // 9223372036854775808.0
+const maxInt64 = int64(1<<63 - 1)     // 9223372036854775807
+const minInt64 = int64(-1 << 63)      // -9223372036854775808
+
+// toInteger converts a numeric value to int64.
+// For float64, only succeeds if the value is integral and within int64 range.
+// Returns the integer value and true if successful.
+func toInteger(v value) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case float64:
+		// Check range first: valid int64 range is [-2^63, 2^63-1]
+		// Due to float64 precision, n >= 2^63 means it's out of range
+		if n >= pow2_63Float || n < -pow2_63Float {
+			return 0, false
+		}
+		// Now safely convert and check round-trip
+		if i := int64(n); float64(i) == n {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// floatToInteger attempts to convert a float64 to int64.
+// Returns the integer and true if the float represents an integer value
+// that is within the valid int64 range.
+func floatToInteger(f float64) (int64, bool) {
+	// Check range first: valid int64 range is [-2^63, 2^63-1]
+	if f >= pow2_63Float || f < -pow2_63Float {
+		return 0, false
+	}
+	i := int64(f)
+	if float64(i) == f {
+		return i, true
+	}
+	return 0, false
+}
+
+// forLimit tries to convert a for-loop limit to an integer.
+// This implements Lua 5.3 semantics where the limit can be a float
+// that represents an integer value, or can be out of integer range
+// (in which case we use MaxInt64 or MinInt64 as appropriate).
+// Returns the integer limit and true if we can use an integer loop.
+func forLimit(limitVal value, step int64) (int64, bool) {
+	switch limit := limitVal.(type) {
+	case int64:
+		return limit, true
+	case float64:
+		// Try to convert float to integer
+		if i, ok := floatToInteger(limit); ok {
+			return i, true
+		}
+		// Float is out of integer range or not integral
+		// If step > 0 and limit > MaxInt64, use MaxInt64
+		// If step < 0 and limit < MinInt64, use MinInt64
+		if step > 0 {
+			if limit > 0 {
+				// limit is larger than MaxInt64
+				return maxInt64, true
+			}
+			// limit is smaller than MinInt64, loop won't run
+			return minInt64, true
+		} else {
+			if limit < 0 {
+				// limit is smaller than MinInt64
+				return minInt64, true
+			}
+			// limit is larger than MaxInt64
+			return maxInt64, true
+		}
+	}
+	return 0, false
 }
 
 type localVariable struct {
@@ -255,15 +368,30 @@ func (l *State) parseNumber(s string) (v float64, ok bool) { // TODO this is f*c
 	}
 	scanner := scanner{l: l, r: strings.NewReader(s)}
 	t := scanner.scan()
-	if t.t == '-' {
-		if t := scanner.scan(); t.t == tkNumber {
-			v, ok = -t.n, true
+
+	// Helper to extract numeric value from token
+	getNumber := func(tok token) (float64, bool) {
+		switch tok.t {
+		case tkNumber:
+			return tok.n, true
+		case tkInteger:
+			return float64(tok.i), true
+		default:
+			return 0, false
 		}
-	} else if t.t == tkNumber {
-		v, ok = t.n, true
+	}
+
+	if t.t == '-' {
+		t = scanner.scan()
+		if n, numOk := getNumber(t); numOk {
+			v, ok = -n, true
+		}
+	} else if n, isNum := getNumber(t); isNum {
+		v, ok = n, true
 	} else if t.t == '+' {
-		if t := scanner.scan(); t.t == tkNumber {
-			v, ok = t.n, true
+		t = scanner.scan()
+		if n, numOk := getNumber(t); numOk {
+			v, ok = n, true
 		}
 	}
 	if ok && scanner.scan().t != tkEOS {
@@ -277,6 +405,9 @@ func (l *State) parseNumber(s string) (v float64, ok bool) { // TODO this is f*c
 func (l *State) toNumber(r value) (v float64, ok bool) {
 	if v, ok = r.(float64); ok {
 		return
+	}
+	if i, isInt := r.(int64); isInt {
+		return float64(i), true
 	}
 	var s string
 	if s, ok = r.(string); ok {
@@ -299,21 +430,28 @@ func numberToString(f float64) string {
 	return fmt.Sprintf("%.14g", f)
 }
 
+func integerToString(i int64) string {
+	return fmt.Sprintf("%d", i)
+}
+
 func toString(r value) (string, bool) {
 	switch r := r.(type) {
 	case string:
 		return r, true
 	case float64:
 		return numberToString(r), true
+	case int64:
+		return integerToString(r), true
 	}
 	return "", false
 }
 
 func pairAsNumbers(p1, p2 value) (f1, f2 float64, ok bool) {
-	if f1, ok = p1.(float64); !ok {
+	f1, ok = toFloat(p1)
+	if !ok {
 		return
 	}
-	f2, ok = p2.(float64)
+	f2, ok = toFloat(p2)
 	return
 }
 

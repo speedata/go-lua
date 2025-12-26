@@ -39,12 +39,32 @@ var mathLibrary = []RegistryFunction{
 	{"asin", mathUnaryOp(math.Asin)},
 	{"atan2", mathBinaryOp(math.Atan2)},
 	{"atan", mathUnaryOp(math.Atan)},
-	{"ceil", mathUnaryOp(math.Ceil)},
+	{"ceil", func(l *State) int {
+		// Lua 5.3: ceil returns integer when result fits
+		x := CheckNumber(l, 1)
+		c := math.Ceil(x)
+		if i := int64(c); float64(i) == c && c >= float64(math.MinInt64) && c <= float64(math.MaxInt64) {
+			l.PushInteger64(i)
+		} else {
+			l.PushNumber(c)
+		}
+		return 1
+	}},
 	{"cosh", mathUnaryOp(math.Cosh)},
 	{"cos", mathUnaryOp(math.Cos)},
 	{"deg", mathUnaryOp(func(x float64) float64 { return x / radiansPerDegree })},
 	{"exp", mathUnaryOp(math.Exp)},
-	{"floor", mathUnaryOp(math.Floor)},
+	{"floor", func(l *State) int {
+		// Lua 5.3: floor returns integer when result fits
+		x := CheckNumber(l, 1)
+		f := math.Floor(x)
+		if i := int64(f); float64(i) == f && f >= float64(math.MinInt64) && f <= float64(math.MaxInt64) {
+			l.PushInteger64(i)
+		} else {
+			l.PushNumber(f)
+		}
+		return 1
+	}},
 	{"fmod", mathBinaryOp(math.Mod)},
 	{"frexp", func(l *State) int {
 		f, e := math.Frexp(CheckNumber(l, 1))
@@ -71,8 +91,20 @@ var mathLibrary = []RegistryFunction{
 	{"max", reduce(math.Max)},
 	{"min", reduce(math.Min)},
 	{"modf", func(l *State) int {
-		i, f := math.Modf(CheckNumber(l, 1))
-		l.PushNumber(i)
+		// Lua 5.3: first return value is integer when it fits
+		n := CheckNumber(l, 1)
+		// Handle infinity: Lua returns (±inf, 0.0), Go returns (±inf, NaN)
+		if math.IsInf(n, 0) {
+			l.PushNumber(n)
+			l.PushNumber(0.0)
+			return 2
+		}
+		i, f := math.Modf(n)
+		if ii := int64(i); float64(ii) == i && i >= float64(math.MinInt64) && i <= float64(math.MaxInt64) {
+			l.PushInteger64(ii)
+		} else {
+			l.PushNumber(i)
+		}
 		l.PushNumber(f)
 		return 2
 	}},
@@ -106,6 +138,56 @@ var mathLibrary = []RegistryFunction{
 	{"sqrt", mathUnaryOp(math.Sqrt)},
 	{"tanh", mathUnaryOp(math.Tanh)},
 	{"tan", mathUnaryOp(math.Tan)},
+	// Lua 5.3: integer functions
+	{"tointeger", func(l *State) int {
+		switch v := l.ToValue(1).(type) {
+		case int64:
+			l.PushInteger64(v)
+		case float64:
+			if i := int64(v); float64(i) == v {
+				l.PushInteger64(i)
+			} else {
+				l.PushNil()
+			}
+		default:
+			// Try string conversion
+			if n, ok := l.ToNumber(1); ok {
+				if i := int64(n); float64(i) == n {
+					l.PushInteger64(i)
+				} else {
+					l.PushNil()
+				}
+			} else {
+				l.PushNil()
+			}
+		}
+		return 1
+	}},
+	{"type", func(l *State) int {
+		// Check actual type, not convertible type (strings should return nil)
+		v := l.ToValue(1)
+		switch v.(type) {
+		case int64:
+			l.PushString("integer")
+		case float64:
+			l.PushString("float")
+		default:
+			l.PushNil()
+		}
+		return 1
+	}},
+	{"ult", func(l *State) int {
+		a, ok1 := l.ToInteger64(1)
+		b, ok2 := l.ToInteger64(2)
+		if !ok1 {
+			ArgumentError(l, 1, "number has no integer representation")
+		}
+		if !ok2 {
+			ArgumentError(l, 2, "number has no integer representation")
+		}
+		l.PushBoolean(uint64(a) < uint64(b))
+		return 1
+	}},
 }
 
 // MathOpen opens the math library. Usually passed to Require.
@@ -113,7 +195,12 @@ func MathOpen(l *State) int {
 	NewLibrary(l, mathLibrary)
 	l.PushNumber(3.1415926535897932384626433832795) // TODO use math.Pi instead? Values differ.
 	l.SetField(-2, "pi")
-	l.PushNumber(math.MaxFloat64)
+	l.PushNumber(math.Inf(1)) // Lua defines math.huge as infinity
 	l.SetField(-2, "huge")
+	// Lua 5.3: integer limits
+	l.PushInteger(math.MaxInt64)
+	l.SetField(-2, "maxinteger")
+	l.PushInteger(math.MinInt64)
+	l.SetField(-2, "mininteger")
 	return 1
 }

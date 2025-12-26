@@ -7,7 +7,7 @@ import (
 const bitCount = 32
 
 func trim(x uint) uint { return x & math.MaxUint32 }
-func mask(n uint) uint { return ^(math.MaxUint32 << n) }
+func mask(n uint) uint { return (1 << n) - 1 }
 
 func shift(l *State, r uint, i int) int {
 	if i < 0 {
@@ -89,11 +89,11 @@ var bitLibrary = []RegistryFunction{
 	{"lrotate", func(l *State) int { return rotate(l, CheckInteger(l, 2)) }},
 	{"lshift", func(l *State) int { return shift(l, CheckUnsigned(l, 1), CheckInteger(l, 2)) }},
 	{"replace", func(l *State) int {
-		r, v := CheckUnsigned(l, 1), CheckUnsigned(l, 2)
+		r, v := trim(CheckUnsigned(l, 1)), trim(CheckUnsigned(l, 2))
 		f, w := fieldArguments(l, 3)
 		m := mask(w)
 		v &= m
-		l.PushUnsigned((r & ^(m << f)) | (v << f))
+		l.PushUnsigned(trim((r & ^(m << f)) | (v << f)))
 		return 1
 	}},
 	{"rrotate", func(l *State) int { return rotate(l, -CheckInteger(l, 2)) }},

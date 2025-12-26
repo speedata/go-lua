@@ -15,14 +15,14 @@ func TestUndumpThenDumpReturnsTheSameFunction(t *testing.T) {
 	if err != nil {
 		t.Skipf("testing dump requires luac: %s", err)
 	}
-	source := filepath.Join("lua-tests", "checktable.lua")
-	binary := filepath.Join("lua-tests", "checktable.bin")
+	source := filepath.Join("lua-tests", "locals.lua")
+	binary := filepath.Join("lua-tests", "locals.bin")
 	if err := exec.Command("luac", "-o", binary, source).Run(); err != nil {
 		t.Fatalf("luac failed to compile %s: %s", source, err)
 	}
 	file, err := os.Open(binary)
 	if err != nil {
-		t.Fatal("couldn't open checktable.bin")
+		t.Fatal("couldn't open locals.bin")
 	}
 
 	l := NewState()
@@ -63,7 +63,7 @@ func TestDumpThenUndumpReturnsTheSameFunction(t *testing.T) {
 	if err != nil {
 		t.Skipf("testing dump requires luac: %s", err)
 	}
-	source := filepath.Join("lua-tests", "checktable.lua")
+	source := filepath.Join("lua-tests", "locals.lua")
 	l := NewState()
 	err = LoadFile(l, source, "")
 	if err != nil {

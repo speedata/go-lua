@@ -171,6 +171,9 @@ func (p *parser) simpleExpression() (e exprDesc) {
 	case tkNumber:
 		e = makeExpression(kindNumber, 0)
 		e.value = p.n
+	case tkInteger:
+		e = makeExpression(kindInteger, 0)
+		e.ivalue = p.i
 	case tkString:
 		e = p.function.EncodeString(p.s)
 	case tkNil:
@@ -203,6 +206,8 @@ func unaryOp(op rune) int {
 		return oprNot
 	case '-':
 		return oprMinus
+	case '~': // Lua 5.3: bitwise NOT
+		return oprBNot
 	case '#':
 		return oprLength
 	}
@@ -217,12 +222,24 @@ func binaryOp(op rune) int {
 		return oprSub
 	case '*':
 		return oprMul
-	case '/':
-		return oprDiv
 	case '%':
 		return oprMod
 	case '^':
 		return oprPow
+	case '/':
+		return oprDiv
+	case tkIDiv: // Lua 5.3: //
+		return oprIDiv
+	case '&': // Lua 5.3: bitwise AND
+		return oprBAnd
+	case '|': // Lua 5.3: bitwise OR
+		return oprBOr
+	case '~': // Lua 5.3: bitwise XOR (binary)
+		return oprBXor
+	case tkShl: // Lua 5.3: <<
+		return oprShl
+	case tkShr: // Lua 5.3: >>
+		return oprShr
 	case tkConcat:
 		return oprConcat
 	case tkNE:
@@ -245,15 +262,24 @@ func binaryOp(op rune) int {
 	return oprNoBinary
 }
 
+// Lua 5.3 operator precedence (higher = binds tighter):
+// or: 1, and: 2, comparisons: 3, |: 4, ~: 5, &: 6, shifts: 7, ..: 8, +/-: 9, */%//: 10, unary: 11, ^: 12
 var priority []struct{ left, right int } = []struct{ left, right int }{
-	{6, 6}, {6, 6}, {7, 7}, {7, 7}, {7, 7}, // `+' `-' `*' `/' `%'
-	{10, 9}, {5, 4}, // ^, .. (right associative)
-	{3, 3}, {3, 3}, {3, 3}, // ==, <, <=
-	{3, 3}, {3, 3}, {3, 3}, // ~=, >, >=
-	{2, 2}, {1, 1}, // and, or
+	{9, 9}, {9, 9}, {10, 10}, // + - *
+	{10, 10},                 // % (Lua 5.3: before pow)
+	{12, 11},                 // ^ (right associative)
+	{10, 10}, {10, 10},       // / //
+	{6, 6},                   // & (bitwise AND)
+	{4, 4},                   // | (bitwise OR)
+	{5, 5},                   // ~ (bitwise XOR)
+	{7, 7}, {7, 7},           // << >>
+	{8, 7},                   // .. (right associative)
+	{3, 3}, {3, 3}, {3, 3},   // == < <=
+	{3, 3}, {3, 3}, {3, 3},   // ~= > >=
+	{2, 2}, {1, 1},           // and or
 }
 
-const unaryPriority = 8
+const unaryPriority = 11
 
 func (p *parser) subExpression(limit int) (e exprDesc, op int) {
 	p.enterLevel()
@@ -360,7 +386,8 @@ func (p *parser) forNumeric(name string, line int) {
 	if p.testNext(',') {
 		expr()
 	} else {
-		p.function.EncodeConstant(p.function.freeRegisterCount, p.function.NumberConstant(1))
+		// Default step is integer 1 (Lua 5.3 integer semantics)
+		p.function.EncodeConstant(p.function.freeRegisterCount, p.function.IntegerConstant(1))
 		p.function.ReserveRegisters(1)
 	}
 	p.forBody(base, line, 1, true)

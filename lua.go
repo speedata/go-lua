@@ -113,8 +113,8 @@ const MinStack = 20
 
 const (
 	VersionMajor  = 5
-	VersionMinor  = 2
-	VersionNumber = 502
+	VersionMinor  = 3
+	VersionNumber = 503
 	VersionString = "Lua " + string('0'+VersionMajor) + "." + string('0'+VersionMinor)
 )
 
@@ -261,7 +261,7 @@ func (g *globalState) metaTable(o value) *table {
 	case bool:
 		t = TypeBoolean
 	// TODO TypeLightUserData
-	case float64:
+	case float64, int64:
 		t = TypeNumber
 	case string:
 		t = TypeString
@@ -638,7 +638,7 @@ func (l *State) valueToType(v value) Type {
 		return TypeBoolean
 	// case lightUserData:
 	// 	return TypeLightUserData
-	case float64:
+	case float64, int64:
 		return TypeNumber
 	case string:
 		return TypeString
@@ -685,16 +685,26 @@ func (l *State) IsNumber(index int) bool {
 	return ok
 }
 
+// IsInteger verifies that the value at index is an integer (a number
+// representable as a Lua integer).
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_isinteger
+func (l *State) IsInteger(index int) bool {
+	_, ok := l.indexToValue(index).(int64)
+	return ok
+}
+
 // IsString verifies that the value at index is a string, or a number (which
 // is always convertible to a string).
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_isstring
 func (l *State) IsString(index int) bool {
-	if _, ok := l.indexToValue(index).(string); ok {
+	v := l.indexToValue(index)
+	switch v.(type) {
+	case string, float64, int64:
 		return true
 	}
-	_, ok := l.indexToValue(index).(float64)
-	return ok
+	return false
 }
 
 // IsUserData verifies that the value at index is a userdata.
@@ -765,10 +775,24 @@ func (l *State) Compare(index1, index2 int, op ComparisonOperator) bool {
 //
 // If the operation failed, the second return value will be false.
 //
-// http://www.lua.org/manual/5.2/manual.html#lua_tointegerx
+// http://www.lua.org/manual/5.3/manual.html#lua_tointegerx
 func (l *State) ToInteger(index int) (int, bool) {
+	if i, ok := toInteger(l.indexToValue(index)); ok {
+		return int(i), true
+	}
 	if n, ok := l.toNumber(l.indexToValue(index)); ok {
 		return int(n), true
+	}
+	return 0, false
+}
+
+// ToInteger64 converts the Lua value at index into a signed 64-bit integer.
+func (l *State) ToInteger64(index int) (int64, bool) {
+	if i, ok := toInteger(l.indexToValue(index)); ok {
+		return i, true
+	}
+	if n, ok := l.toNumber(l.indexToValue(index)); ok {
+		return int64(n), true
 	}
 	return 0, false
 }
@@ -785,6 +809,9 @@ func (l *State) ToInteger(index int) (int, bool) {
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_tounsignedx
 func (l *State) ToUnsigned(index int) (uint, bool) {
+	if i, ok := toInteger(l.indexToValue(index)); ok {
+		return uint(i), true
+	}
 	if n, ok := l.toNumber(l.indexToValue(index)); ok {
 		const supUnsigned = float64(^uint32(0)) + 1
 		return uint(n - math.Floor(n/supUnsigned)*supUnsigned), true
@@ -871,7 +898,7 @@ func (l *State) ToThread(index int) *State {
 func (l *State) ToValue(index int) interface{} {
 	v := l.indexToValue(index)
 	switch v := v.(type) {
-	case string, float64, bool, *table, *luaClosure, *goClosure, *goFunction, *State:
+	case string, float64, int64, bool, *table, *luaClosure, *goClosure, *goFunction, *State:
 	case *userData:
 		return v.data
 	default:
@@ -1436,15 +1463,18 @@ func (l *State) PushNil() { l.apiPush(nil) }
 // http://www.lua.org/manual/5.2/manual.html#lua_pushnumber
 func (l *State) PushNumber(n float64) { l.apiPush(n) }
 
-// PushInteger pushes n onto the stack.
+// PushInteger pushes n onto the stack as a Lua integer.
 //
-// http://www.lua.org/manual/5.2/manual.html#lua_pushinteger
-func (l *State) PushInteger(n int) { l.apiPush(float64(n)) }
+// http://www.lua.org/manual/5.3/manual.html#lua_pushinteger
+func (l *State) PushInteger(n int) { l.apiPush(int64(n)) }
 
-// PushUnsigned pushes n onto the stack.
+// PushInteger64 pushes n onto the stack as a Lua integer.
+func (l *State) PushInteger64(n int64) { l.apiPush(n) }
+
+// PushUnsigned pushes n onto the stack as a Lua integer.
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_pushunsigned
-func (l *State) PushUnsigned(n uint) { l.apiPush(float64(n)) }
+func (l *State) PushUnsigned(n uint) { l.apiPush(int64(n)) }
 
 // PushBoolean pushes a boolean value with value b onto the stack.
 //

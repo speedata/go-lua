@@ -1,11 +1,11 @@
 package lua_test
 
 import (
-	"github.com/Shopify/go-lua"
+	"github.com/speedata/go-lua"
 )
 
-// This example receives a variable number of numerical arguments and returns their average and sum.
-func ExampleFunction(l *lua.State) int {
+// This shows a Go function callable from Lua that receives a variable number of numerical arguments and returns their average and sum.
+func averageAndSum(l *lua.State) int {
 	n := l.Top() // Number of arguments.
 	var sum float64
 	for i := 1; i <= n; i++ {

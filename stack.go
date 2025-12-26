@@ -1,6 +1,9 @@
 package lua
 
-import "log"
+import (
+	"fmt"
+	"log"
+)
 
 func (l *State) push(v value) {
 	l.stack[l.top] = v
@@ -332,6 +335,8 @@ func (l *State) adjustVarArgs(p *prototype, argCount int) int {
 	// move fixed parameters to final position
 	fixed := l.top - argCount // first fixed argument
 	base := l.top             // final position of first argument
+	// Ensure we have enough stack space for the fixed args at the new position
+	l.checkStack(fixedArgCount)
 	fixedArgs := l.stack[fixed : fixed+fixedArgCount]
 	copy(l.stack[base:base+fixedArgCount], fixedArgs)
 	for i := range fixedArgs {
@@ -406,7 +411,12 @@ func (l *State) protect(f func()) (err error) {
 	nestedGoCallCount, protectFunction := l.nestedGoCallCount, l.protectFunction
 	l.protectFunction = func() {
 		if e := recover(); e != nil {
-			err = e.(error)
+			if errVal, ok := e.(error); ok {
+				err = errVal
+			} else {
+				// Handle non-error panics (e.g., strings)
+				err = fmt.Errorf("%v", e)
+			}
 			l.nestedGoCallCount, l.protectFunction = nestedGoCallCount, protectFunction
 		}
 	}

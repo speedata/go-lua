@@ -1,2 +1,6 @@
-lua-tests/
 .DS_[sS]tore
+lua-5.2.4/
+lua-5.3.6/
+luac.out
+*.test
+.claude/
