@@ -278,12 +278,16 @@ func arrayIndex(k value) int {
 
 func (l *State) next(t *table, key int) bool {
 	i, k := 0, l.stack[key]
+	keyInHash := false
 	if k == nil { // first iteration
 	} else if i = arrayIndex(k); 0 < i && i <= len(t.array) {
 		k = nil
-	} else if _, ok := t.hash[k]; !ok {
-		l.runtimeError("invalid key to 'next'") // key not found
+	} else if _, ok := t.hash[k]; ok {
+		keyInHash = true
+		i = len(t.array)
 	} else {
+		// Key not in hash - might have been deleted during iteration
+		// We'll check iterationKeys below; if not found there, error
 		i = len(t.array)
 	}
 	for ; i < len(t.array); i++ {
@@ -304,15 +308,33 @@ func (l *State) next(t *table, key int) bool {
 	found := k == nil
 	for i, hk := range t.iterationKeys {
 		if hk == nil { // skip deleted key
-		} else if _, present := t.hash[hk]; !present {
+			continue
+		}
+		// Check if key was deleted from hash
+		deleted := false
+		if _, present := t.hash[hk]; !present {
 			t.iterationKeys[i] = nil // mark key as deleted
-		} else if found {
+			deleted = true
+		}
+		// Check if this is our current key (even if deleted)
+		if !found && l.equalObjects(hk, k) {
+			found = true
+			continue
+		}
+		// Skip deleted keys for returning
+		if deleted {
+			continue
+		}
+		// Return next valid key
+		if found {
 			l.stack[key] = hk
 			l.stack[key+1] = t.hash[hk]
 			return true
-		} else if l.equalObjects(hk, k) {
-			found = true
 		}
+	}
+	// If key was not in hash and not found in iterationKeys, it's invalid
+	if k != nil && !keyInHash && !found {
+		l.runtimeError("invalid key to 'next'")
 	}
 	return false // no more elements
 }
