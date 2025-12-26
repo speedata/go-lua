@@ -108,27 +108,54 @@ func (l *State) arithError(v1, v2 value) {
 // it reports "number has no integer representation". Otherwise, it
 // falls back to standard arithmetic error.
 func (l *State) bitwiseError(v1, v2 value) {
-	// pow2_63 is 2^63 as float64, the boundary for valid int64 range
-	const pow2_63 = float64(1 << 63)
-	// Check if v1 is a float that can't be converted to integer
-	if f, ok := v1.(float64); ok {
-		// Check for out-of-range or non-integer
+	// Helper to check if a float can't be converted to integer
+	cantConvert := func(f float64) bool {
+		const pow2_63 = float64(1 << 63)
 		if f >= pow2_63 || f < -pow2_63 {
-			l.runtimeError("number has no integer representation")
+			return true
 		}
-		if i := int64(f); float64(i) != f {
-			l.runtimeError("number has no integer representation")
+		return float64(int64(f)) != f
+	}
+
+	// Helper to get operand name from debug info
+	getOperandName := func(v value) string {
+		ci := l.callInfo
+		if !ci.isLua() {
+			return ""
 		}
+		c := l.stack[ci.function].(*luaClosure)
+		// Check upvalues first
+		for i, uv := range c.upValues {
+			if uv.value() == v {
+				return fmt.Sprintf("upvalue '%s'", c.prototype.upValueName(i))
+			}
+		}
+		// Check stack frame
+		for i, e := range ci.frame {
+			if e == v {
+				name, kind := c.prototype.objectName(i, ci.savedPC-1)
+				if kind != "" {
+					return fmt.Sprintf("%s '%s'", kind, name)
+				}
+				break
+			}
+		}
+		return ""
+	}
+
+	// Check if v1 is a float that can't be converted to integer
+	if f, ok := v1.(float64); ok && cantConvert(f) {
+		if name := getOperandName(v1); name != "" {
+			l.runtimeError(fmt.Sprintf("number (%s) has no integer representation", name))
+		}
+		l.runtimeError("number has no integer representation")
 	}
 	// Check if v2 is a float that can't be converted to integer
-	if f, ok := v2.(float64); ok {
-		// Check for out-of-range or non-integer
-		if f >= pow2_63 || f < -pow2_63 {
-			l.runtimeError("number has no integer representation")
+	if f, ok := v2.(float64); ok && cantConvert(f) {
+		if name := getOperandName(v2); name != "" {
+			l.runtimeError(fmt.Sprintf("number (%s) has no integer representation", name))
 		}
-		if i := int64(f); float64(i) != f {
-			l.runtimeError("number has no integer representation")
-		}
+		l.runtimeError("number has no integer representation")
 	}
 	// Otherwise, fall back to standard arithmetic error (for non-numeric types)
 	l.arithError(v1, v2)

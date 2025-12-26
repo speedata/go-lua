@@ -283,15 +283,19 @@ func (p *prototype) objectName(reg int, lastPC pc) (name, kind string) {
 				return p.objectName(b, pc)
 			}
 		case opGetTableUp:
-			name, kind = p.constantName(i.c(), pc), "local"
+			name = p.constantName(i.c(), pc)
 			if p.upValueName(i.b()) == "_ENV" {
 				kind = "global"
+			} else {
+				kind = "field"
 			}
 			return
 		case opGetTable:
-			name, kind = p.constantName(i.c(), pc), "local"
+			name = p.constantName(i.c(), pc)
 			if v, ok := p.localName(i.b()+1, pc); ok && v == "_ENV" {
 				kind = "global"
+			} else {
+				kind = "field"
 			}
 			return
 		case opGetUpValue:
@@ -379,6 +383,75 @@ func arith(op Operator, v1, v2 float64) float64 {
 	panic(fmt.Sprintf("not an arithmetic op code (%d)", op))
 }
 
+// parseNumberEx parses a number string and returns either an integer or float.
+// Returns (intVal, floatVal, isInteger, ok). If ok is false, parsing failed.
+// If ok is true and isInteger is true, use intVal; otherwise use floatVal.
+func (l *State) parseNumberEx(s string) (intVal int64, floatVal float64, isInt bool, ok bool) {
+	if len(strings.Fields(s)) != 1 || strings.ContainsRune(s, 0) {
+		return 0, 0, false, false
+	}
+
+	// Special case: check for exact minint string representation before scanning
+	// This handles "-9223372036854775808" which can't be parsed by scanning
+	// the absolute value (since 9223372036854775808 overflows int64)
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "-9223372036854775808" {
+		return minInt64, 0, true, true
+	}
+
+	// Use protectedCall to catch scanner errors (e.g., from invalid hex like "0x")
+	var success bool
+	err := l.protectedCall(func() {
+		scanner := scanner{l: l, r: strings.NewReader(s)}
+		t := scanner.scan()
+
+		neg := false
+		if t.t == '-' {
+			neg = true
+			t = scanner.scan()
+		} else if t.t == '+' {
+			t = scanner.scan()
+		}
+
+		switch t.t {
+		case tkInteger:
+			if scanner.scan().t != tkEOS {
+				return
+			}
+			if neg {
+				intVal = -t.i
+			} else {
+				intVal = t.i
+			}
+			isInt = true
+			success = true
+		case tkNumber:
+			if scanner.scan().t != tkEOS {
+				return
+			}
+			// NaN is not a valid number, but Inf is allowed in Lua 5.3
+			if math.IsNaN(t.n) {
+				return
+			}
+			if neg {
+				floatVal = -t.n
+			} else {
+				floatVal = t.n
+			}
+			success = true
+		}
+	}, l.top, l.errorFunction)
+
+	if err != nil {
+		l.pop() // Remove error message from the stack
+		return 0, 0, false, false
+	}
+	if !success {
+		return 0, 0, false, false
+	}
+	return intVal, floatVal, isInt, true
+}
+
 func (l *State) parseNumber(s string) (v float64, ok bool) { // TODO this is f*cking ugly - scanner.readNumber should be refactored.
 	if len(strings.Fields(s)) != 1 || strings.ContainsRune(s, 0) {
 		return
@@ -413,7 +486,8 @@ func (l *State) parseNumber(s string) (v float64, ok bool) { // TODO this is f*c
 	}
 	if ok && scanner.scan().t != tkEOS {
 		ok = false
-	} else if math.IsInf(v, 0) || math.IsNaN(v) {
+	} else if math.IsNaN(v) {
+		// NaN is not valid, but Inf is allowed in Lua 5.3
 		ok = false
 	}
 	return

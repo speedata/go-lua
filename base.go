@@ -311,9 +311,24 @@ var baseLibrary = []RegistryFunction{
 	}},
 	{"tonumber", func(l *State) int {
 		if l.IsNoneOrNil(2) { // standard conversion
-			if n, ok := l.ToNumber(1); ok {
-				l.PushNumber(n)
+			// Lua 5.3: preserve integer/float type
+			switch v := l.ToValue(1).(type) {
+			case int64:
+				l.PushInteger64(v)
 				return 1
+			case float64:
+				l.PushNumber(v)
+				return 1
+			case string:
+				// Try to parse as number, preserving integer type
+				if i, f, isInt, ok := l.parseNumberEx(strings.TrimSpace(v)); ok {
+					if isInt {
+						l.PushInteger64(i)
+					} else {
+						l.PushNumber(f)
+					}
+					return 1
+				}
 			}
 			CheckAny(l, 1)
 		} else {
@@ -321,7 +336,7 @@ var baseLibrary = []RegistryFunction{
 			base := CheckInteger(l, 2)
 			ArgumentCheck(l, 2 <= base && base <= 36, 2, "base out of range")
 			if i, err := strconv.ParseInt(strings.TrimSpace(s), base, 64); err == nil {
-				l.PushNumber(float64(i))
+				l.PushInteger64(i)
 				return 1
 			}
 		}

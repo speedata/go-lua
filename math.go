@@ -21,24 +21,85 @@ func mathBinaryOp(f func(float64, float64) float64) Function {
 	}
 }
 
-func reduce(f func(float64, float64) float64) Function {
+// reduce creates a min/max function that preserves integer type in Lua 5.3
+func reduce(f func(float64, float64) float64, isMax bool) Function {
 	return func(l *State) int {
 		n := l.Top() // number of arguments
-		v := CheckNumber(l, 1)
-		for i := 2; i <= n; i++ {
-			v = f(v, CheckNumber(l, i))
+		CheckAny(l, 1) // "value expected" error if no arguments
+
+		// Track if all arguments are integers and result should be integer
+		allInt := true
+		var intResult int64
+		var floatResult float64
+
+		for i := 1; i <= n; i++ {
+			if allInt && l.IsInteger(i) {
+				v, _ := l.ToInteger64(i)
+				if i == 1 {
+					intResult = v
+				} else {
+					if isMax {
+						if v > intResult {
+							intResult = v
+						}
+					} else {
+						if v < intResult {
+							intResult = v
+						}
+					}
+				}
+			} else {
+				// Switch to float mode
+				if allInt {
+					floatResult = float64(intResult)
+					allInt = false
+				}
+				v := CheckNumber(l, i)
+				if i == 1 || allInt {
+					floatResult = v
+				} else {
+					floatResult = f(floatResult, v)
+				}
+			}
 		}
-		l.PushNumber(v)
+
+		if allInt {
+			l.PushInteger64(intResult)
+		} else {
+			l.PushNumber(floatResult)
+		}
 		return 1
 	}
 }
 
 var mathLibrary = []RegistryFunction{
-	{"abs", mathUnaryOp(math.Abs)},
+	{"abs", func(l *State) int {
+		// Lua 5.3: abs preserves integer type
+		if l.IsInteger(1) {
+			i, _ := l.ToInteger64(1)
+			if i < 0 {
+				i = -i // overflow wraps for minint
+			}
+			l.PushInteger64(i)
+		} else {
+			l.PushNumber(math.Abs(CheckNumber(l, 1)))
+		}
+		return 1
+	}},
 	{"acos", mathUnaryOp(math.Acos)},
 	{"asin", mathUnaryOp(math.Asin)},
 	{"atan2", mathBinaryOp(math.Atan2)},
-	{"atan", mathUnaryOp(math.Atan)},
+	{"atan", func(l *State) int {
+		// Lua 5.3: atan(y [, x]) - if x is given, returns atan2(y, x)
+		y := CheckNumber(l, 1)
+		if l.IsNoneOrNil(2) {
+			l.PushNumber(math.Atan(y))
+		} else {
+			x := CheckNumber(l, 2)
+			l.PushNumber(math.Atan2(y, x))
+		}
+		return 1
+	}},
 	{"ceil", func(l *State) int {
 		// Lua 5.3: ceil returns integer when result fits
 		x := CheckNumber(l, 1)
@@ -65,7 +126,20 @@ var mathLibrary = []RegistryFunction{
 		}
 		return 1
 	}},
-	{"fmod", mathBinaryOp(math.Mod)},
+	{"fmod", func(l *State) int {
+		// Lua 5.3: fmod preserves integer type when both args are integers
+		if l.IsInteger(1) && l.IsInteger(2) {
+			x, _ := l.ToInteger64(1)
+			y, _ := l.ToInteger64(2)
+			if y == 0 {
+				Errorf(l, "zero")
+			}
+			l.PushInteger64(x % y)
+		} else {
+			l.PushNumber(math.Mod(CheckNumber(l, 1), CheckNumber(l, 2)))
+		}
+		return 1
+	}},
 	{"frexp", func(l *State) int {
 		f, e := math.Frexp(CheckNumber(l, 1))
 		l.PushNumber(f)
@@ -88,8 +162,8 @@ var mathLibrary = []RegistryFunction{
 		}
 		return 1
 	}},
-	{"max", reduce(math.Max)},
-	{"min", reduce(math.Min)},
+	{"max", reduce(math.Max, true)},
+	{"min", reduce(math.Min, false)},
 	{"modf", func(l *State) int {
 		// Lua 5.3: first return value is integer when it fits
 		n := CheckNumber(l, 1)
@@ -111,18 +185,58 @@ var mathLibrary = []RegistryFunction{
 	{"pow", mathBinaryOp(math.Pow)},
 	{"rad", mathUnaryOp(func(x float64) float64 { return x * radiansPerDegree })},
 	{"random", func(l *State) int {
-		r := rand.Float64()
+		// Helper to get int64 argument
+		checkInt64 := func(index int) int64 {
+			i, ok := l.ToInteger64(index)
+			if !ok {
+				ArgumentError(l, index, "integer expected")
+			}
+			return i
+		}
+		// randRange returns a random int64 in [lo, u] inclusive
+		// Returns (result, ok) where ok is false if range is too large
+		randRange := func(lo, u int64) (int64, bool) {
+			if lo == u {
+				return lo, true
+			}
+			// Use uint64 arithmetic to avoid overflow
+			rangeLow := uint64(lo - math.MinInt64)   // shift to [0, 2^64 - 1] range
+			rangeHigh := uint64(u - math.MinInt64)
+			rangeSize := rangeHigh - rangeLow + 1
+			if rangeSize == 0 {
+				// Would need full 64-bit range - this is too large
+				return 0, false
+			}
+			// Lua 5.3 allows ranges up to 2^63 (half the 64-bit space)
+			// Ranges larger than this are rejected as "too large"
+			const maxRange = uint64(1) << 63
+			if rangeSize > maxRange {
+				return 0, false
+			}
+			// Random in [0, rangeSize), then shift back
+			r := rand.Uint64() % rangeSize
+			return int64(r+rangeLow) + math.MinInt64, true
+		}
 		switch l.Top() {
-		case 0: // no arguments
-			l.PushNumber(r)
-		case 1: // upper limit only
-			u := CheckNumber(l, 1)
-			ArgumentCheck(l, 1.0 <= u, 1, "interval is empty")
-			l.PushNumber(math.Floor(r*u) + 1.0) // [1, u]
-		case 2: // lower and upper limits
-			lo, u := CheckNumber(l, 1), CheckNumber(l, 2)
+		case 0: // no arguments - returns float in [0,1)
+			l.PushNumber(rand.Float64())
+		case 1: // upper limit only - returns integer in [1, u]
+			u := checkInt64(1)
+			ArgumentCheck(l, 1 <= u, 1, "interval is empty")
+			r, ok := randRange(1, u)
+			if !ok {
+				Errorf(l, "interval too large")
+			}
+			l.PushInteger64(r)
+		case 2: // lower and upper limits - returns integer in [lo, u]
+			lo := checkInt64(1)
+			u := checkInt64(2)
 			ArgumentCheck(l, lo <= u, 2, "interval is empty")
-			l.PushNumber(math.Floor(r*(u-lo+1)) + lo) // [lo, u]
+			r, ok := randRange(lo, u)
+			if !ok {
+				Errorf(l, "interval too large")
+			}
+			l.PushInteger64(r)
 		default:
 			Errorf(l, "wrong number of arguments")
 		}
@@ -144,16 +258,33 @@ var mathLibrary = []RegistryFunction{
 		case int64:
 			l.PushInteger64(v)
 		case float64:
-			if i := int64(v); float64(i) == v {
+			// Check range before conversion to avoid overflow
+			// float64 can represent values outside int64 range
+			const maxInt64Float = float64(1 << 63)  // 2^63
+			if v >= maxInt64Float || v < -maxInt64Float {
+				l.PushNil()
+			} else if i := int64(v); float64(i) == v {
 				l.PushInteger64(i)
 			} else {
 				l.PushNil()
 			}
 		default:
-			// Try string conversion
-			if n, ok := l.ToNumber(1); ok {
-				if i := int64(n); float64(i) == n {
-					l.PushInteger64(i)
+			// Try string conversion - use parseNumberEx to preserve integer precision
+			if s, ok := l.ToValue(1).(string); ok {
+				if intVal, floatVal, isInt, ok := l.parseNumberEx(s); ok {
+					if isInt {
+						l.PushInteger64(intVal)
+					} else {
+						// Float value - apply same range check
+						const maxInt64Float = float64(1 << 63)
+						if floatVal >= maxInt64Float || floatVal < -maxInt64Float {
+							l.PushNil()
+						} else if i := int64(floatVal); float64(i) == floatVal {
+							l.PushInteger64(i)
+						} else {
+							l.PushNil()
+						}
+					}
 				} else {
 					l.PushNil()
 				}

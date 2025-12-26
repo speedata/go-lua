@@ -221,26 +221,89 @@ func isHexadecimal(c rune) bool {
 	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
 }
 
-func (s *scanner) readHexNumber(x float64) (n float64, c rune, i int) {
+func (s *scanner) readHexNumber(x float64) (n float64, c rune, i int, overflow int) {
 	if c, n = s.current, x; !isHexadecimal(c) {
 		return
 	}
+	// float64 can represent integers up to 2^53 precisely.
+	// After that, we just count digits as exponent overflow.
+	const maxPrecise = float64(1 << 53)
 	for {
 		origC := c // Save original character before conversion
+		var digit float64
 		switch {
 		case '0' <= c && c <= '9':
-			c = c - '0'
+			digit = float64(c - '0')
 		case 'a' <= c && c <= 'f':
-			c = c - 'a' + 10
+			digit = float64(c - 'a' + 10)
 		case 'A' <= c && c <= 'F':
-			c = c - 'A' + 10
+			digit = float64(c - 'A' + 10)
 		default:
 			return
 		}
 		s.save(origC) // Save hex digit for integer parsing
 		s.advance()
-		c, n, i = s.current, n*16.0+float64(c), i+1
+		i++
+		c = s.current
+		if n >= maxPrecise {
+			// Beyond float64 precision, just track overflow
+			overflow++
+		} else {
+			n = n*16.0 + digit
+		}
 	}
+}
+
+// readHexFraction reads hex digits after the decimal point, returning the
+// fractional value, current char, digit count, and exponent adjustment.
+// It handles cases with many leading zeros by tracking them as exponent offset,
+// and cases with many trailing zeros by dividing instead of multiplying.
+func (s *scanner) readHexFraction() (frac float64, c rune, count int, expAdj int) {
+	c = s.current
+	leadingZeros := 0
+	gotSignificant := false
+	const maxPrecise = float64(1 << 53)
+
+	for isHexadecimal(c) {
+		origC := c
+		var digit float64
+		switch {
+		case '0' <= c && c <= '9':
+			digit = float64(c - '0')
+		case 'a' <= c && c <= 'f':
+			digit = float64(c - 'a' + 10)
+		case 'A' <= c && c <= 'F':
+			digit = float64(c - 'A' + 10)
+		}
+		s.save(origC)
+		s.advance()
+		count++
+		c = s.current
+
+		if !gotSignificant {
+			if digit == 0 {
+				// Track leading zeros for exponent adjustment
+				leadingZeros++
+				continue
+			}
+			gotSignificant = true
+		}
+
+		// Accumulate as integer-like value (we'll adjust with exponent)
+		if frac < maxPrecise {
+			frac = frac*16.0 + digit
+		}
+		// Digits beyond precision are ignored (they don't affect float64 result)
+	}
+	// The fractional value should be: frac / 16^(count)
+	// But we return frac as accumulated value, with expAdj = -(leadingZeros + digits_accumulated) * 4
+	// Actually simpler: expAdj tells us how many positions to shift
+	// frac * 2^expAdj gives the correct fractional value
+	if gotSignificant {
+		digitsAccumulated := count - leadingZeros
+		expAdj = -(leadingZeros + digitsAccumulated) * 4
+	}
+	return
 }
 
 func (s *scanner) readNumber() token {
@@ -254,16 +317,36 @@ func (s *scanner) readNumber() token {
 		s.buffer.Reset()
 		var exponent int
 		isFloat := false
-		fraction, c, i := s.readHexNumber(0)
+		fraction, c, i, overflow := s.readHexNumber(0)
+		var fracDigits int
+		var fracExp int
+		var frac float64
 		if c == '.' {
 			isFloat = true
 			s.advance()
-			fraction, c, exponent = s.readHexNumber(fraction)
+			frac, c, fracDigits, fracExp = s.readHexFraction()
 		}
-		if i == 0 && exponent == 0 {
+		if i == 0 && fracDigits == 0 {
 			s.numberError()
 		}
-		exponent *= -4
+		// Each overflow digit = factor of 16 = 2^4
+		exponent = overflow * 4
+		// Combine integer and fractional parts
+		// fraction * 2^exponent + frac * 2^fracExp
+		if frac != 0 {
+			if fraction == 0 {
+				// Pure fractional number like 0x.ABC
+				fraction = frac
+				exponent = fracExp
+			} else {
+				// Mixed number like 0x3.14
+				// fraction is the integer part, frac is accumulated fractional digits
+				// fracExp = -(totalFracDigits) * 4
+				// We need: fraction + frac * 2^fracExp
+				// = fraction + frac / 16^totalFracDigits
+				fraction = fraction + math.Ldexp(frac, fracExp)
+			}
+		}
 		if c == 'p' || c == 'P' {
 			isFloat = true
 			s.buffer.Reset() // Clear buffer before reading exponent
@@ -286,8 +369,10 @@ func (s *scanner) readNumber() token {
 			}
 			s.buffer.Reset()
 		}
-		// Lua 5.3: hex integer if no decimal point or exponent
-		if !isFloat && exponent == 0 {
+		// Lua 5.3: hex integer if no decimal point or 'p' exponent
+		// Note: We check !isFloat, not exponent==0, because overflow tracking
+		// may set exponent for float calculations, but integers use wrapping uint64
+		if !isFloat {
 			hexStr := s.buffer.String()
 			s.buffer.Reset()
 			// Parse as unsigned with wrapping for values larger than 64 bits
