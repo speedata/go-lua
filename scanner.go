@@ -69,7 +69,7 @@ var tokens []string = []string{
 type token struct {
 	t rune
 	n float64
-	i int64  // Lua 5.3: integer value
+	i int64 // Lua 5.3: integer value
 	s string
 }
 

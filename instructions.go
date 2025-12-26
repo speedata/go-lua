@@ -28,7 +28,7 @@ const (
 	opAdd
 	opSub
 	opMul
-	opMod  // Lua 5.3: MOD before POW
+	opMod // Lua 5.3: MOD before POW
 	opPow
 	opDiv
 	opIDiv // Lua 5.3: Integer division //

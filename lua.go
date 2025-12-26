@@ -203,8 +203,10 @@ type Function func(state *State) int
 // Local(activationRecord *Debug, index int) string
 // SetLocal(activationRecord *Debug, index int) string
 
-type pc int
-type callStatus byte
+type (
+	pc         int
+	callStatus byte
+)
 
 const (
 	callStatusLua                callStatus = 1 << iota // call is running a Lua function
@@ -373,9 +375,9 @@ func (l *State) CallWithContinuation(argCount, resultCount, context int, continu
 //
 // The possible errors are the following:
 //
-//    RuntimeError  a runtime error
-//    MemoryError   allocating memory, the error handler is not called
-//    ErrorError    running the error handler
+//	RuntimeError  a runtime error
+//	MemoryError   allocating memory, the error handler is not called
+//	ErrorError    running the error handler
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_pcall
 func (l *State) ProtectedCall(argCount, resultCount, errorFunction int) error {
@@ -1206,13 +1208,13 @@ func (l *State) Error() {
 //
 // A typical traversal looks like this:
 //
-//  // Table is on top of the stack (index -1).
-//  l.PushNil() // Add nil entry on stack (need 2 free slots).
-//  for l.Next(-2) {
-//  	key := lua.CheckString(l, -2)
-//  	val := lua.CheckString(l, -1)
-//  	l.Pop(1) // Remove val, but need key for the next iter.
-//  }
+//	// Table is on top of the stack (index -1).
+//	l.PushNil() // Add nil entry on stack (need 2 free slots).
+//	for l.Next(-2) {
+//		key := lua.CheckString(l, -2)
+//		val := lua.CheckString(l, -1)
+//		l.Pop(1) // Remove val, but need key for the next iter.
+//	}
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_next
 func (l *State) Next(index int) bool {
@@ -1365,18 +1367,18 @@ func UpValueJoin(l *State, f1, n1, f2, n2 int) {
 // The following example shows how the host program can do the equivalent to
 // this Lua code:
 //
-//		a = f("how", t.x, 14)
+//	a = f("how", t.x, 14)
 //
 // Here it is in Go:
 //
-//		l.Global("f")       // Function to be called.
-//		l.PushString("how") // 1st argument.
-//		l.Global("t")       // Table to be indexed.
-//		l.Field(-1, "x")    // Push result of t.x (2nd arg).
-//		l.Remove(-2)        // Remove t from the stack.
-//		l.PushInteger(14)   // 3rd argument.
-//		l.Call(3, 1)        // Call f with 3 arguments and 1 result.
-//		l.SetGlobal("a")    // Set global a.
+//	l.Global("f")       // Function to be called.
+//	l.PushString("how") // 1st argument.
+//	l.Global("t")       // Table to be indexed.
+//	l.Field(-1, "x")    // Push result of t.x (2nd arg).
+//	l.Remove(-2)        // Remove t from the stack.
+//	l.PushInteger(14)   // 3rd argument.
+//	l.Call(3, 1)        // Call f with 3 arguments and 1 result.
+//	l.SetGlobal("a")    // Set global a.
 //
 // Note that the code above is "balanced": at its end, the stack is back to
 // its original configuration. This is considered good programming practice.

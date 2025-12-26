@@ -14,7 +14,7 @@ func (l *State) prototype(ci *callInfo) *prototype {
 	return l.stack[ci.function].(*luaClosure).prototype
 }
 func (l *State) currentLine(ci *callInfo) int {
-	return int(l.prototype(ci).lineInfo[ci.savedPC - 1])
+	return int(l.prototype(ci).lineInfo[ci.savedPC-1])
 }
 
 func chunkID(source string) string {
@@ -368,19 +368,22 @@ func (l *State) collectValidLines(f closure) {
 // the what string with the character '>'. (In that case, Info pops the
 // function from the top of the stack.) For instance, to know in which line
 // a function f was defined, you can write the following code:
-//   l.Global("f") // Get global 'f'.
-//   d, _ := lua.Info(l, ">S", nil)
-//   fmt.Printf("%d\n", d.LineDefined)
+//
+//	l.Global("f") // Get global 'f'.
+//	d, _ := lua.Info(l, ">S", nil)
+//	fmt.Printf("%d\n", d.LineDefined)
 //
 // Each character in the string what selects some fields of the Debug struct
 // to be filled or a value to be pushed on the stack:
-// 	 'n': fills in the field Name and NameKind
-// 	 'S': fills in the fields Source, ShortSource, LineDefined, LastLineDefined, and What
-// 	 'l': fills in the field CurrentLine
-// 	 't': fills in the field IsTailCall
-// 	 'u': fills in the fields UpValueCount, ParameterCount, and IsVarArg
-// 	 'f': pushes onto the stack the function that is running at the given level
-// 	 'L': pushes onto the stack a table whose indices are the numbers of the lines that are valid on the function
+//
+//	'n': fills in the field Name and NameKind
+//	'S': fills in the fields Source, ShortSource, LineDefined, LastLineDefined, and What
+//	'l': fills in the field CurrentLine
+//	't': fills in the field IsTailCall
+//	'u': fills in the fields UpValueCount, ParameterCount, and IsVarArg
+//	'f': pushes onto the stack the function that is running at the given level
+//	'L': pushes onto the stack a table whose indices are the numbers of the lines that are valid on the function
+//
 // (A valid line is a line with some associated code, that is, a line where you
 // can put a break point. Non-valid lines include empty lines and comments.)
 //

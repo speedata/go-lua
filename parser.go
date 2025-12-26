@@ -266,17 +266,17 @@ func binaryOp(op rune) int {
 // or: 1, and: 2, comparisons: 3, |: 4, ~: 5, &: 6, shifts: 7, ..: 8, +/-: 9, */%//: 10, unary: 11, ^: 12
 var priority []struct{ left, right int } = []struct{ left, right int }{
 	{9, 9}, {9, 9}, {10, 10}, // + - *
-	{10, 10},                 // % (Lua 5.3: before pow)
-	{12, 11},                 // ^ (right associative)
-	{10, 10}, {10, 10},       // / //
-	{6, 6},                   // & (bitwise AND)
-	{4, 4},                   // | (bitwise OR)
-	{5, 5},                   // ~ (bitwise XOR)
-	{7, 7}, {7, 7},           // << >>
-	{8, 7},                   // .. (right associative)
-	{3, 3}, {3, 3}, {3, 3},   // == < <=
-	{3, 3}, {3, 3}, {3, 3},   // ~= > >=
-	{2, 2}, {1, 1},           // and or
+	{10, 10},           // % (Lua 5.3: before pow)
+	{12, 11},           // ^ (right associative)
+	{10, 10}, {10, 10}, // / //
+	{6, 6},         // & (bitwise AND)
+	{4, 4},         // | (bitwise OR)
+	{5, 5},         // ~ (bitwise XOR)
+	{7, 7}, {7, 7}, // << >>
+	{8, 7},                 // .. (right associative)
+	{3, 3}, {3, 3}, {3, 3}, // == < <=
+	{3, 3}, {3, 3}, {3, 3}, // ~= > >=
+	{2, 2}, {1, 1}, // and or
 }
 
 const unaryPriority = 11

@@ -195,4 +195,3 @@ func comparePrototypesLenient(t *testing.T, a, b *prototype) {
 		comparePrototypesLenient(t, &a.prototypes[i], &b.prototypes[i])
 	}
 }
-

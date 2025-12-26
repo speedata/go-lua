@@ -193,8 +193,8 @@ var baseLibrary = []RegistryFunction{
 		// Check for __ipairs metamethod first
 		if hasMetamethod := MetaField(l, 1, "__ipairs"); !hasMetamethod {
 			CheckType(l, 1, TypeTable)
-			ipairsAux(l)   // push cached iterator function
-			l.PushValue(1) // state (the table)
+			ipairsAux(l)     // push cached iterator function
+			l.PushValue(1)   // state (the table)
 			l.PushInteger(0) // initial value
 		} else {
 			l.PushValue(1)

@@ -192,7 +192,7 @@ var tableLibrary = []RegistryFunction{
 			// Helper to set value respecting __newindex
 			setVal := func(idx int) {
 				l.PushInteger(idx)
-				l.Insert(-2) // key before value
+				l.Insert(-2)   // key before value
 				l.SetTable(tt) // pops key and value
 			}
 			if t > e || t <= f || !sameTable {

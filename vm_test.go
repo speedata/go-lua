@@ -10,8 +10,9 @@ import (
 
 func testString(t *testing.T, s string) { testStringHelper(t, s, false) }
 
-// Commented out to avoid a warning relating to the method not being used. Left here since it's useful for debugging.
-//func traceString(t *testing.T, s string) { testStringHelper(t, s, true) }
+// Commented out to avoid a warning relating to the method not being used. Left
+// here since it's useful for debugging.
+// func traceString(t *testing.T, s string) { testStringHelper(t, s, true) }
 
 func testNoPanicString(t *testing.T, s string) {
 	defer func() {
@@ -78,8 +79,8 @@ func TestLua(t *testing.T) {
 		{name: "pm"},
 		{name: "sort", nonPort: true},
 		{name: "strings"},
-		{name: "tpack"},          // Lua 5.3: string.pack/unpack tests
-		{name: "utf8"},           // Lua 5.3: utf8 library tests
+		{name: "tpack"}, // Lua 5.3: string.pack/unpack tests
+		{name: "utf8"},  // Lua 5.3: utf8 library tests
 		{name: "vararg"},
 		// {name: "verybig"},     // Very slow/memory intensive
 	}
@@ -468,9 +469,9 @@ func TestIntIDiv(t *testing.T) {
 		m, n, want int64
 	}{
 		{10, 3, 3},
-		{-10, 3, -4},   // floor division: -10/3 = -3.33... -> -4
-		{10, -3, -4},   // floor division: 10/-3 = -3.33... -> -4
-		{-10, -3, 3},   // floor division: -10/-3 = 3.33... -> 3
+		{-10, 3, -4}, // floor division: -10/3 = -3.33... -> -4
+		{10, -3, -4}, // floor division: 10/-3 = -3.33... -> -4
+		{-10, -3, 3}, // floor division: -10/-3 = 3.33... -> 3
 		{9, 3, 3},
 		{0, 5, 0},
 		{100, 7, 14},
@@ -492,13 +493,13 @@ func TestIntShiftLeft(t *testing.T) {
 		{1, 1, 2},
 		{1, 4, 16},
 		{1, 63, -9223372036854775808}, // MinInt64 = 1 << 63
-		{1, 64, 0},      // shift >= 64 returns 0
-		{1, 100, 0},     // shift >= 64 returns 0
-		{16, -1, 8},     // negative shift = right shift
+		{1, 64, 0},                    // shift >= 64 returns 0
+		{1, 100, 0},                   // shift >= 64 returns 0
+		{16, -1, 8},                   // negative shift = right shift
 		{16, -2, 4},
 		{16, -4, 1},
 		{16, -5, 0},
-		{-1, -64, 0},    // large negative shift
+		{-1, -64, 0}, // large negative shift
 		{0xFF, 4, 0xFF0},
 	}
 	for _, tt := range tests {
@@ -510,6 +511,8 @@ func TestIntShiftLeft(t *testing.T) {
 }
 
 func TestIntegerValues(t *testing.T) {
+	// integerValues is strict: only accepts direct int64 values
+	// Use coerceToIntegers for float/string conversion
 	tests := []struct {
 		b, c   value
 		wantIb int64
@@ -517,12 +520,12 @@ func TestIntegerValues(t *testing.T) {
 		wantOk bool
 	}{
 		{int64(5), int64(3), 5, 3, true},
-		{float64(5.0), int64(3), 5, 3, true},
-		{int64(5), float64(3.0), 5, 3, true},
-		{float64(5.0), float64(3.0), 5, 3, true},
-		{float64(5.5), int64(3), 0, 0, false},  // non-integer float
-		{int64(5), float64(3.5), 5, 0, false},  // non-integer float
-		{"5", int64(3), 0, 0, false},           // string not converted
+		{float64(5.0), int64(3), 0, 0, false},  // float64 not accepted
+		{int64(5), float64(3.0), 0, 0, false},  // float64 not accepted
+		{float64(5.0), float64(3.0), 0, 0, false}, // float64 not accepted
+		{float64(5.5), int64(3), 0, 0, false},
+		{int64(5), float64(3.5), 0, 0, false},
+		{"5", int64(3), 0, 0, false},
 	}
 	for _, tt := range tests {
 		ib, ic, ok := integerValues(tt.b, tt.c)

@@ -7,9 +7,11 @@ import (
 	"os"
 )
 
-const fileHandle = "FILE*"
-const input = "_IO_input"
-const output = "_IO_output"
+const (
+	fileHandle = "FILE*"
+	input      = "_IO_input"
+	output     = "_IO_output"
+)
 
 type stream struct {
 	f     *os.File
@@ -123,9 +125,9 @@ func read(l *State, f *os.File, argIndex int) int {
 	} else {
 		// TODO
 	}
-	if err != nil {
-		return FileResult(l, err, "")
-	}
+	// if err != nil {
+	// 	return FileResult(l, err, "")
+	// }
 	if err == io.EOF {
 		l.Pop(1)
 		l.PushNil()

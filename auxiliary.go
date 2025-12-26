@@ -113,8 +113,9 @@ func CallMeta(l *State, index int, event string) bool {
 // ArgumentError raises an error with a standard message that includes extraMessage as a comment.
 //
 // This function never returns. It is an idiom to use it in Go functions as
-//  lua.ArgumentError(l, args, "message")
-//  panic("unreachable")
+//
+//	lua.ArgumentError(l, args, "message")
+//	panic("unreachable")
 func ArgumentError(l *State, argCount int, extraMessage string) {
 	f, ok := Stack(l, 0)
 	if !ok { // no stack frame?
@@ -182,7 +183,9 @@ func tagError(l *State, argCount int, tag Type) { typeError(l, argCount, tag.Str
 // Where pushes onto the stack a string identifying the current position of
 // the control at level in the call stack. Typically this string has the
 // following format:
-//   chunkname:currentline:
+//
+//	chunkname:currentline:
+//
 // Level 0 is the running function, level 1 is the function that called the
 // running function, etc.
 //
@@ -204,8 +207,9 @@ func Where(l *State, level int) {
 // the error occurred, if this information is available.
 //
 // This function never returns. It is an idiom to use it in Go functions as:
-//   lua.Errorf(l, args)
-//   panic("unreachable")
+//
+//	lua.Errorf(l, args)
+//	panic("unreachable")
 func Errorf(l *State, format string, a ...interface{}) {
 	Where(l, 1)
 	l.PushFString(format, a...)

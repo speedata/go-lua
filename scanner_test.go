@@ -26,16 +26,16 @@ func TestScanner(t *testing.T) {
 		{"...", []token{{t: tkDots}}},
 		{".34", []token{{t: tkNumber, n: 0.34}}},
 		{"_foo", []token{{t: tkName, s: "_foo"}}},
-		{"3", []token{{t: tkInteger, i: 3}}},                           // Lua 5.3: integer literal
+		{"3", []token{{t: tkInteger, i: 3}}}, // Lua 5.3: integer literal
 		{"3.0", []token{{t: tkNumber, n: 3.0}}},
 		{"3.1416", []token{{t: tkNumber, n: 3.1416}}},
 		{"314.16e-2", []token{{t: tkNumber, n: 3.1416}}},
 		{"0.31416E1", []token{{t: tkNumber, n: 3.1416}}},
-		{"0xff", []token{{t: tkInteger, i: 0xff}}},                     // Lua 5.3: hex integer literal
+		{"0xff", []token{{t: tkInteger, i: 0xff}}}, // Lua 5.3: hex integer literal
 		{"0x0.1E", []token{{t: tkNumber, n: 0.1171875}}},
 		{"0xA23p-4", []token{{t: tkNumber, n: 162.1875}}},
 		{"0X1.921FB54442D18P+1", []token{{t: tkNumber, n: 3.141592653589793}}},
-		{"  -0xa  ", []token{{t: '-'}, {t: tkInteger, i: 10}}},         // Lua 5.3: hex integer literal
+		{"  -0xa  ", []token{{t: '-'}, {t: tkInteger, i: 10}}}, // Lua 5.3: hex integer literal
 	}
 	for i, v := range tests {
 		testScanner(t, i, v.source, v.tokens)

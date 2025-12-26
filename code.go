@@ -7,7 +7,7 @@ import (
 
 const (
 	oprMinus = iota
-	oprBNot // Lua 5.3: bitwise NOT ~
+	oprBNot  // Lua 5.3: bitwise NOT ~
 	oprNot
 	oprLength
 	oprNoUnary
@@ -26,12 +26,12 @@ const (
 	oprMod // Lua 5.3: MOD before DIV
 	oprPow
 	oprDiv
-	oprIDiv  // Lua 5.3: integer division //
-	oprBAnd  // Lua 5.3: bitwise AND &
-	oprBOr   // Lua 5.3: bitwise OR |
-	oprBXor  // Lua 5.3: bitwise XOR ~
-	oprShl   // Lua 5.3: shift left <<
-	oprShr   // Lua 5.3: shift right >>
+	oprIDiv // Lua 5.3: integer division //
+	oprBAnd // Lua 5.3: bitwise AND &
+	oprBOr  // Lua 5.3: bitwise OR |
+	oprBXor // Lua 5.3: bitwise XOR ~
+	oprShl  // Lua 5.3: shift left <<
+	oprShr  // Lua 5.3: shift right >>
 	oprConcat
 	oprEq
 	oprLT
@@ -306,9 +306,11 @@ func (f *function) unreachable()                        { f.assert(false) }
 func (f *function) assert(cond bool)                    { f.p.l.assert(cond) }
 func (f *function) Instruction(e exprDesc) *instruction { return &f.f.code[e.info] }
 func (e exprDesc) hasJumps() bool                       { return e.t != e.f }
-func (e exprDesc) isNumeral() bool                      { return (e.kind == kindNumber || e.kind == kindInteger) && e.t == noJump && e.f == noJump }
-func (e exprDesc) isVariable() bool                     { return kindLocal <= e.kind && e.kind <= kindIndexed }
-func (e exprDesc) hasMultipleReturns() bool             { return e.kind == kindCall || e.kind == kindVarArg }
+func (e exprDesc) isNumeral() bool {
+	return (e.kind == kindNumber || e.kind == kindInteger) && e.t == noJump && e.f == noJump
+}
+func (e exprDesc) isVariable() bool         { return kindLocal <= e.kind && e.kind <= kindIndexed }
+func (e exprDesc) hasMultipleReturns() bool { return e.kind == kindCall || e.kind == kindVarArg }
 
 func (f *function) assertEqual(a, b interface{}) {
 	if a != b {

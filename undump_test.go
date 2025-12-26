@@ -24,7 +24,7 @@ func TestWrongEndian(t *testing.T) {
 
 func TestWrongVersion(t *testing.T) {
 	h := header
-	h.Version += 1
+	h.Version++
 	expectErrorFromUndump(errVersionMismatch, h, t)
 }
 
@@ -36,7 +36,7 @@ func TestWrongNumberSize(t *testing.T) {
 
 func TestCorruptData(t *testing.T) {
 	h := header
-	h.Data[3] += 1
+	h.Data[3]++
 	expectErrorFromUndump(errCorrupted, h, t)
 }
 

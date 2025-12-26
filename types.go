@@ -8,8 +8,10 @@ import (
 	"strings"
 )
 
-type value interface{}
-type float8 int
+type (
+	value  interface{}
+	float8 int
+)
 
 func debugValue(v value) string {
 	switch v := v.(type) {
@@ -105,9 +107,11 @@ func toFloat(v value) (float64, bool) {
 
 // pow2_63 is 2^63 as float64, used for range checks.
 // This is the smallest float64 that cannot be represented as int64.
-const pow2_63Float = float64(1 << 63) // 9223372036854775808.0
-const maxInt64 = int64(1<<63 - 1)     // 9223372036854775807
-const minInt64 = int64(-1 << 63)      // -9223372036854775808
+const (
+	pow2_63Float = float64(1 << 63) // 9223372036854775808.0
+	maxInt64     = int64(1<<63 - 1) // 9223372036854775807
+	minInt64     = int64(-1 << 63)  // -9223372036854775808
+)
 
 // toInteger converts a numeric value to int64.
 // For float64, only succeeds if the value is integral and within int64 range.
@@ -186,14 +190,13 @@ func forLimit(limitVal value, step int64) (int64, bool) {
 			}
 			// limit is smaller than MinInt64, loop won't run
 			return minInt64, true
-		} else {
-			if limit < 0 {
-				// limit is smaller than MinInt64
-				return minInt64, true
-			}
-			// limit is larger than MaxInt64
-			return maxInt64, true
 		}
+		if limit < 0 {
+			// limit is smaller than MinInt64
+			return minInt64, true
+		}
+		// limit is larger than MaxInt64
+		return maxInt64, true
 	}
 	return 0, false
 }
@@ -441,7 +444,6 @@ func (l *State) parseNumberEx(s string) (intVal int64, floatVal float64, isInt b
 			success = true
 		}
 	}, l.top, l.errorFunction)
-
 	if err != nil {
 		l.pop() // Remove error message from the stack
 		return 0, 0, false, false

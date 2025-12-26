@@ -24,7 +24,7 @@ func mathBinaryOp(f func(float64, float64) float64) Function {
 // reduce creates a min/max function that preserves integer type in Lua 5.3
 func reduce(f func(float64, float64) float64, isMax bool) Function {
 	return func(l *State) int {
-		n := l.Top() // number of arguments
+		n := l.Top()   // number of arguments
 		CheckAny(l, 1) // "value expected" error if no arguments
 
 		// Track if all arguments are integers and result should be integer
@@ -200,7 +200,7 @@ var mathLibrary = []RegistryFunction{
 				return lo, true
 			}
 			// Use uint64 arithmetic to avoid overflow
-			rangeLow := uint64(lo - math.MinInt64)   // shift to [0, 2^64 - 1] range
+			rangeLow := uint64(lo - math.MinInt64) // shift to [0, 2^64 - 1] range
 			rangeHigh := uint64(u - math.MinInt64)
 			rangeSize := rangeHigh - rangeLow + 1
 			if rangeSize == 0 {
@@ -260,7 +260,7 @@ var mathLibrary = []RegistryFunction{
 		case float64:
 			// Check range before conversion to avoid overflow
 			// float64 can represent values outside int64 range
-			const maxInt64Float = float64(1 << 63)  // 2^63
+			const maxInt64Float = float64(1 << 63) // 2^63
 			if v >= maxInt64Float || v < -maxInt64Float {
 				l.PushNil()
 			} else if i := int64(v); float64(i) == v {

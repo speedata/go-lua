@@ -775,19 +775,19 @@ func formatHelper(l *State, fs string, argCount int) string {
 //   (space) = ignored
 
 type packState struct {
-	fmt        string
-	pos        int
-	littleEnd  bool
-	maxAlign   int
+	fmt           string
+	pos           int
+	littleEnd     bool
+	maxAlign      int
 	alignExplicit bool // true if ! was used explicitly
 }
 
 func newPackState(fmt string) *packState {
 	return &packState{
-		fmt:       fmt,
-		pos:       0,
-		littleEnd: nativeEndian() == binary.LittleEndian,
-		maxAlign:  1, // default is 1 (no alignment); ! option changes this
+		fmt:           fmt,
+		pos:           0,
+		littleEnd:     nativeEndian() == binary.LittleEndian,
+		maxAlign:      1, // default is 1 (no alignment); ! option changes this
 		alignExplicit: false,
 	}
 }

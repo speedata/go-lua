@@ -16,14 +16,14 @@ type loadState struct {
 
 // Lua 5.3 header format
 var header struct {
-	Signature                  [4]byte
-	Version, Format            byte
-	Data                       [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
-	IntSize, PointerSize       byte
-	InstructionSize            byte
-	IntegerSize, NumberSize    byte
-	TestInt                    int64   // LUAC_INT: 0x5678
-	TestNum                    float64 // LUAC_NUM: 370.5
+	Signature               [4]byte
+	Version, Format         byte
+	Data                    [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
+	IntSize, PointerSize    byte
+	InstructionSize         byte
+	IntegerSize, NumberSize byte
+	TestInt                 int64   // LUAC_INT: 0x5678
+	TestNum                 float64 // LUAC_NUM: 370.5
 }
 
 var (
@@ -320,9 +320,9 @@ func init() {
 	copy(header.Data[:], data)
 	header.IntSize = 4
 	header.PointerSize = byte(1+^uintptr(0)>>32&1) * 4
-	header.InstructionSize = byte(1+^instruction(0)>>32&1) * 4
-	header.IntegerSize = 8 // sizeof(lua_Integer) = int64
-	header.NumberSize = 8  // sizeof(lua_Number) = float64
+	header.InstructionSize = 4 // sizeof(Instruction) = uint32
+	header.IntegerSize = 8     // sizeof(lua_Integer) = int64
+	header.NumberSize = 8      // sizeof(lua_Number) = float64
 	header.TestInt = 0x5678
 	header.TestNum = 370.5
 
