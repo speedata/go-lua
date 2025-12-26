@@ -534,7 +534,121 @@ var debugLibrary = []RegistryFunction{
 		l.PushInteger(DebugHookCount(l1))
 		return 3
 	}},
-	// {"getinfo", db_getinfo},
+	{"getinfo", func(l *State) int {
+		// debug.getinfo ([thread,] f [, what])
+		// f can be a function or a stack level (integer)
+		// what is an optional string of options (default "flnStu")
+		arg := 1
+		// TODO: thread argument support would go here
+
+		options := OptString(l, arg+1, "flnStu")
+
+		var ar Frame
+		var d Debug
+		var ok bool
+
+		// Count how many values Info() will push (for 'f' and 'L')
+		hasF := strings.Contains(options, "f")
+		hasL := strings.Contains(options, "L")
+
+		if l.IsFunction(arg) {
+			// Info about a function - use ">" prefix
+			l.PushValue(arg) // push function to top
+			d, ok = Info(l, ">"+options, nil)
+			if !ok {
+				ArgumentError(l, arg+1, "invalid option")
+			}
+		} else {
+			// Stack level
+			level := CheckInteger(l, arg)
+			ar, ok = Stack(l, level)
+			if !ok {
+				l.PushNil() // level out of range
+				return 1
+			}
+			d, ok = Info(l, options, ar)
+			if !ok {
+				ArgumentError(l, arg+1, "invalid option")
+			}
+		}
+
+		// Info() pushes 'f' first, then 'L' (if requested)
+		// Stack after Info(): ... [func] [activelines]
+		// We need to save these before creating the result table
+
+		// Create result table
+		l.CreateTable(0, 12)
+		resultIdx := l.Top() // index of result table
+
+		if strings.Contains(options, "S") {
+			l.PushString(d.Source)
+			l.SetField(resultIdx, "source")
+			l.PushString(d.ShortSource)
+			l.SetField(resultIdx, "short_src")
+			l.PushInteger(d.LineDefined)
+			l.SetField(resultIdx, "linedefined")
+			l.PushInteger(d.LastLineDefined)
+			l.SetField(resultIdx, "lastlinedefined")
+			l.PushString(d.What)
+			l.SetField(resultIdx, "what")
+		}
+		if strings.Contains(options, "l") {
+			l.PushInteger(d.CurrentLine)
+			l.SetField(resultIdx, "currentline")
+		}
+		if strings.Contains(options, "u") {
+			l.PushInteger(d.UpValueCount)
+			l.SetField(resultIdx, "nups")
+			l.PushInteger(d.ParameterCount)
+			l.SetField(resultIdx, "nparams")
+			l.PushBoolean(d.IsVarArg)
+			l.SetField(resultIdx, "isvararg")
+		}
+		if strings.Contains(options, "n") {
+			l.PushString(d.Name)
+			l.SetField(resultIdx, "name")
+			l.PushString(d.NameKind)
+			l.SetField(resultIdx, "namewhat")
+		}
+		if strings.Contains(options, "t") {
+			l.PushBoolean(d.IsTailCall)
+			l.SetField(resultIdx, "istailcall")
+		}
+
+		// 'f' and 'L' values were pushed by Info() before the result table
+		// Stack: ... [func?] [activelines?] [result_table]
+		// We need to move them into the result table
+		if hasL {
+			// activelines is at resultIdx-1 (or resultIdx-2 if hasF)
+			idx := resultIdx - 1
+			if hasF {
+				idx = resultIdx - 1
+			}
+			l.PushValue(idx)
+			l.SetField(resultIdx, "activelines")
+		}
+		if hasF {
+			// func is at resultIdx-1 (or resultIdx-2 if hasL)
+			idx := resultIdx - 1
+			if hasL {
+				idx = resultIdx - 2
+			}
+			l.PushValue(idx)
+			l.SetField(resultIdx, "func")
+		}
+
+		// Move result table to correct position and clean up
+		// Stack: ... [func?] [activelines?] [result_table]
+		if hasF || hasL {
+			// Move result table down, remove the extra values
+			l.Replace(resultIdx - 1)
+			if hasF && hasL {
+				l.Pop(1) // remove the other extra value
+			}
+		}
+
+		return 1
+	}},
 	// {"getlocal", db_getlocal},
 	{"getregistry", func(l *State) int { l.PushValue(RegistryIndex); return 1 }},
 	{"getmetatable", func(l *State) int {
