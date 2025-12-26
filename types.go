@@ -112,6 +112,7 @@ const minInt64 = int64(-1 << 63)      // -9223372036854775808
 // toInteger converts a numeric value to int64.
 // For float64, only succeeds if the value is integral and within int64 range.
 // Returns the integer value and true if successful.
+// NOTE: This does NOT convert strings. Use State.toIntegerString for that.
 func toInteger(v value) (int64, bool) {
 	switch n := v.(type) {
 	case int64:
@@ -125,6 +126,22 @@ func toInteger(v value) (int64, bool) {
 		// Now safely convert and check round-trip
 		if i := int64(n); float64(i) == n {
 			return i, true
+		}
+	}
+	return 0, false
+}
+
+// toIntegerString converts a value to int64, including string coercion.
+// In Lua 5.3, strings are coerced to integers for bitwise operations.
+func (l *State) toIntegerString(v value) (int64, bool) {
+	// First try direct numeric conversion
+	if i, ok := toInteger(v); ok {
+		return i, ok
+	}
+	// Try string coercion
+	if s, ok := v.(string); ok {
+		if f, ok := l.toNumber(s); ok {
+			return floatToInteger(f)
 		}
 	}
 	return 0, false

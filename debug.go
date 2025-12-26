@@ -274,7 +274,12 @@ func (l *State) functionName(ci *callInfo) (name, kind string) {
 	}
 	var tm tm
 	p := l.prototype(ci)
-	pc := ci.savedPC
+	// savedPC points to the NEXT instruction to execute, so subtract 1
+	// to get the actual call instruction
+	pc := ci.savedPC - 1
+	if pc < 0 {
+		return
+	}
 	switch i := p.code[pc]; i.opCode() {
 	case opCall, opTailCall:
 		return p.objectName(i.a(), pc)

@@ -30,14 +30,14 @@ func integerValues(b, c value) (ib, ic int64, ok bool) {
 }
 
 // coerceToIntegers attempts to convert both operands to int64 for bitwise operations.
-// Floats with exact integer representations are converted. This matches Lua 5.3
-// bitwise operation semantics where floats can be coerced to integers.
-func coerceToIntegers(b, c value) (ib, ic int64, ok bool) {
-	ib, ok = toInteger(b)
+// Floats with exact integer representations are converted, and strings are coerced
+// to numbers first. This matches Lua 5.3 bitwise operation semantics.
+func (l *State) coerceToIntegers(b, c value) (ib, ic int64, ok bool) {
+	ib, ok = l.toIntegerString(b)
 	if !ok {
 		return
 	}
-	ic, ok = toInteger(c)
+	ic, ok = l.toIntegerString(c)
 	return
 }
 
@@ -909,7 +909,7 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opBAnd (Lua 5.3: bitwise AND)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
 				e.frame[i.a()] = ib & ic
 				if e.hooked() {
 					e.hook()
@@ -929,7 +929,7 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opBOr (Lua 5.3: bitwise OR)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
 				e.frame[i.a()] = ib | ic
 				if e.hooked() {
 					e.hook()
@@ -949,7 +949,7 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opBXor (Lua 5.3: bitwise XOR)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
 				e.frame[i.a()] = ib ^ ic
 				if e.hooked() {
 					e.hook()
@@ -969,7 +969,7 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opShl (Lua 5.3: shift left)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
 				e.frame[i.a()] = intShiftLeft(ib, ic)
 				if e.hooked() {
 					e.hook()
@@ -989,7 +989,7 @@ func init() {
 		func(e *engine, i instruction) (engineOp, instruction) { // opShr (Lua 5.3: shift right)
 			b := e.k(i.b())
 			c := e.k(i.c())
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
 				e.frame[i.a()] = intShiftLeft(ib, -ic)
 				if e.hooked() {
 					e.hook()
@@ -1031,7 +1031,7 @@ func init() {
 		},
 		func(e *engine, i instruction) (engineOp, instruction) { // opBNot (Lua 5.3: bitwise NOT)
 			b := e.frame[i.b()]
-			if ib, ok := toInteger(b); ok {
+			if ib, ok := e.l.toIntegerString(b); ok {
 				e.frame[i.a()] = ^ib
 				if e.hooked() {
 					e.hook()
@@ -1616,7 +1616,7 @@ func (l *State) executeSwitch() {
 		case opBAnd: // Lua 5.3: bitwise AND
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
 				frame[i.a()] = ib & ic
 				break
 			}
@@ -1626,7 +1626,7 @@ func (l *State) executeSwitch() {
 		case opBOr: // Lua 5.3: bitwise OR
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
 				frame[i.a()] = ib | ic
 				break
 			}
@@ -1636,7 +1636,7 @@ func (l *State) executeSwitch() {
 		case opBXor: // Lua 5.3: bitwise XOR
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
 				frame[i.a()] = ib ^ ic
 				break
 			}
@@ -1646,7 +1646,7 @@ func (l *State) executeSwitch() {
 		case opShl: // Lua 5.3: shift left
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
 				frame[i.a()] = intShiftLeft(ib, ic)
 				break
 			}
@@ -1656,7 +1656,7 @@ func (l *State) executeSwitch() {
 		case opShr: // Lua 5.3: shift right
 			b := k(i.b(), constants, frame)
 			c := k(i.c(), constants, frame)
-			if ib, ic, ok := coerceToIntegers(b, c); ok {
+			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
 				frame[i.a()] = intShiftLeft(ib, -ic)
 				break
 			}
@@ -1682,7 +1682,7 @@ func (l *State) executeSwitch() {
 			}
 		case opBNot: // Lua 5.3: bitwise NOT
 			b := frame[i.b()]
-			if ib, ok := toInteger(b); ok {
+			if ib, ok := l.toIntegerString(b); ok {
 				frame[i.a()] = ^ib
 				break
 			}

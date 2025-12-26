@@ -58,11 +58,11 @@ func TestLua(t *testing.T) {
 	}{
 		// {name: "attrib"},     // Requires coroutine module
 		// {name: "big"},         // EXTRAARG handling issue with large (>2^18 element) tables
-		// {name: "bitwise"},     // Requires string-to-int coercion for bitwise ops
+		{name: "bitwise"},
 		// {name: "calls"},       // Requires debug.getinfo
 		// {name: "closure"},     // Hangs - needs investigation
 		{name: "code"},
-		// {name: "constructs"},  // Requires debug.getinfo
+		{name: "constructs"},
 		// {name: "coroutine"},   // Coroutines not implemented
 		// {name: "db"},          // Uses coroutines
 		// {name: "errors"},      // Uses coroutines
