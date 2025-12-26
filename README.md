@@ -17,6 +17,7 @@ This fork upgrades the original Lua 5.2 implementation to **Lua 5.3**, adding:
 - String packing: `string.pack`, `string.unpack`, `string.packsize`
 - Math extensions: `math.tointeger`, `math.type`, `math.ult`, `math.maxinteger`, `math.mininteger`
 - Table move: `table.move(a1, f, e, t [,a2])`
+- Table metamethods: `table.insert`, `table.remove`, `table.sort` respect `__index`/`__newindex`
 - Hex float format: `string.format` supports `%a`/`%A`
 
 ## Installation

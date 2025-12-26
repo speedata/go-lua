@@ -17,10 +17,19 @@ func (h sortHelper) Swap(i, j int) {
 	// Convert Go to Lua indices
 	i++
 	j++
-	h.l.RawGetInt(1, i)
-	h.l.RawGetInt(1, j)
-	h.l.RawSetInt(1, i)
-	h.l.RawSetInt(1, j)
+	// Get t[i] and t[j] via __index
+	h.l.PushInteger(i)
+	h.l.Table(1) // t[i]
+	h.l.PushInteger(j)
+	h.l.Table(1) // t[j]
+	// Set t[i] = old t[j] via __newindex
+	h.l.PushInteger(i)
+	h.l.Insert(-2) // key before value
+	h.l.SetTable(1)
+	// Set t[j] = old t[i] via __newindex
+	h.l.PushInteger(j)
+	h.l.Insert(-2) // key before value
+	h.l.SetTable(1)
 }
 
 func (h sortHelper) Less(i, j int) bool {
@@ -29,15 +38,21 @@ func (h sortHelper) Less(i, j int) bool {
 	j++
 	if h.hasFunction {
 		h.l.PushValue(2)
-		h.l.RawGetInt(1, i)
-		h.l.RawGetInt(1, j)
+		// Get t[i] and t[j] via __index
+		h.l.PushInteger(i)
+		h.l.Table(1)
+		h.l.PushInteger(j)
+		h.l.Table(1)
 		h.l.Call(2, 1)
 		b := h.l.ToBoolean(-1)
 		h.l.Pop(1)
 		return b
 	}
-	h.l.RawGetInt(1, i)
-	h.l.RawGetInt(1, j)
+	// Get t[i] and t[j] via __index
+	h.l.PushInteger(i)
+	h.l.Table(1)
+	h.l.PushInteger(j)
+	h.l.Table(1)
 	b := h.l.Compare(-2, -1, OpLT)
 	h.l.Pop(2)
 	return b
@@ -56,7 +71,9 @@ var tableLibrary = []RegistryFunction{
 		}
 		s := ""
 		addField := func() {
-			l.RawGetInt(1, i)
+			// Get t[i] via __index
+			l.PushInteger(i)
+			l.Table(1)
 			if str, ok := l.ToString(-1); ok {
 				s += str
 			} else {
@@ -79,15 +96,25 @@ var tableLibrary = []RegistryFunction{
 		e := LengthEx(l, 1) + 1 // First empty element.
 		switch l.Top() {
 		case 2:
-			l.RawSetInt(1, e) // Insert new element at the end.
+			// Insert new element at the end (value is at top)
+			l.PushInteger(e)
+			l.Insert(-2) // key before value
+			l.SetTable(1)
 		case 3:
 			pos := CheckInteger(l, 2)
 			ArgumentCheck(l, 1 <= pos && pos <= e, 2, "position out of bounds")
 			for i := e; i > pos; i-- {
-				l.RawGetInt(1, i-1)
-				l.RawSetInt(1, i) // t[i] = t[i-1]
+				// t[i] = t[i-1]
+				l.PushInteger(i - 1)
+				l.Table(1) // get t[i-1]
+				l.PushInteger(i)
+				l.Insert(-2)  // key before value
+				l.SetTable(1) // set t[i]
 			}
-			l.RawSetInt(1, pos) // t[pos] = v
+			// t[pos] = v (value was at index 3)
+			l.PushInteger(pos)
+			l.Insert(-2)  // key before value
+			l.SetTable(1) // set t[pos]
 		default:
 			Errorf(l, "wrong number of arguments to 'insert'")
 		}
@@ -125,8 +152,11 @@ var tableLibrary = []RegistryFunction{
 			Errorf(l, "too many results to unpack")
 			panic("unreachable")
 		}
-		for l.RawGetInt(1, i); i < e; i++ {
-			l.RawGetInt(1, i+1)
+		// Get all elements via __index
+		// Use countdown to avoid integer overflow when i == maxInt
+		for j := 0; j < n; j++ {
+			l.PushInteger(i + j)
+			l.Table(1) // get t[i+j]
 		}
 		return n
 	}},
@@ -137,12 +167,21 @@ var tableLibrary = []RegistryFunction{
 		if pos != size {
 			ArgumentCheck(l, 1 <= pos && pos <= size+1, 2, "position out of bounds")
 		}
-		for l.RawGetInt(1, pos); pos < size; pos++ {
-			l.RawGetInt(1, pos+1)
-			l.RawSetInt(1, pos) // t[pos] = t[pos+1]
+		// Get element to return: push key, get value via __index
+		l.PushInteger(pos)
+		l.Table(1) // get t[pos], push to stack (this is our return value)
+		for ; pos < size; pos++ {
+			// t[pos] = t[pos+1]
+			l.PushInteger(pos + 1)
+			l.Table(1) // get t[pos+1]
+			l.PushInteger(pos)
+			l.Insert(-2)  // key before value
+			l.SetTable(1) // set t[pos]
 		}
+		// t[pos] = nil
+		l.PushInteger(pos)
 		l.PushNil()
-		l.RawSetInt(1, pos) // t[pos] = nil
+		l.SetTable(1)
 		return 1
 	}},
 	{"sort", func(l *State) int {
@@ -155,6 +194,9 @@ var tableLibrary = []RegistryFunction{
 			CheckType(l, 2, TypeFunction)
 		}
 		l.SetTop(2)
+		// Ensure stack space for sort operations. Swap/Less use up to 5 slots
+		// directly, plus metamethods (__index/__newindex) may use more.
+		l.CheckStack(40)
 		h := sortHelper{l, n, hasFunction}
 		sort.Sort(h)
 		// Check result is sorted.

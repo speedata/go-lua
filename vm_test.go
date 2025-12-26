@@ -75,7 +75,7 @@ func TestLua(t *testing.T) {
 		{name: "locals"},
 		// {name: "main"},        // Requires command-line Lua
 		{name: "math"},
-		// {name: "nextvar"},     // ipairs returns new function each time
+		// {name: "nextvar"}, // TODO: hangs on some test (not the metamethods part)
 		{name: "pm"},
 		{name: "sort", nonPort: true},
 		{name: "strings"},
@@ -520,8 +520,8 @@ func TestIntegerValues(t *testing.T) {
 		wantOk bool
 	}{
 		{int64(5), int64(3), 5, 3, true},
-		{float64(5.0), int64(3), 0, 0, false},  // float64 not accepted
-		{int64(5), float64(3.0), 0, 0, false},  // float64 not accepted
+		{float64(5.0), int64(3), 0, 0, false},     // float64 not accepted
+		{int64(5), float64(3.0), 0, 0, false},     // float64 not accepted
 		{float64(5.0), float64(3.0), 0, 0, false}, // float64 not accepted
 		{float64(5.5), int64(3), 0, 0, false},
 		{int64(5), float64(3.5), 0, 0, false},
@@ -1025,5 +1025,107 @@ func TestLuaGsub(t *testing.T) {
 		-- Escape percent in replacement
 		s = string.gsub("hello", "hello", "100%%")
 		assert(s == "100%", "percent escape failed: " .. s)
+	`)
+}
+
+func TestTableMetamethods(t *testing.T) {
+	// Test table.insert with metamethods
+	testString(t, `
+		local t = {}
+		local proxy = setmetatable({}, {
+			__len = function() return #t end,
+			__index = t,
+			__newindex = t,
+		})
+		table.insert(proxy, 1, 10)
+		table.insert(proxy, 1, 20)
+		table.insert(proxy, 1, 30)
+		assert(#proxy == 3, "expected length 3, got " .. #proxy)
+		assert(t[1] == 30, "t[1] should be 30, got " .. tostring(t[1]))
+		assert(t[2] == 20, "t[2] should be 20, got " .. tostring(t[2]))
+		assert(t[3] == 10, "t[3] should be 10, got " .. tostring(t[3]))
+	`)
+}
+
+func TestTableSortWithMetamethods(t *testing.T) {
+	// Test table.sort with small array and metamethods
+	testString(t, `
+		local t = {3, 1, 4, 1, 5}
+		local proxy = setmetatable({}, {
+			__len = function() return #t end,
+			__index = t,
+			__newindex = t,
+		})
+		table.sort(proxy)
+		assert(t[1] == 1, "t[1] should be 1, got " .. tostring(t[1]))
+		assert(t[2] == 1, "t[2] should be 1, got " .. tostring(t[2]))
+		assert(t[3] == 3, "t[3] should be 3, got " .. tostring(t[3]))
+		assert(t[4] == 4, "t[4] should be 4, got " .. tostring(t[4]))
+		assert(t[5] == 5, "t[5] should be 5, got " .. tostring(t[5]))
+	`)
+}
+
+func TestTableSortLarge(t *testing.T) {
+	// Test table.sort with 50000 elements - no metamethods
+	testString(t, `
+		local a = {}
+		for i = 1, 50000 do
+			a[i] = math.random()
+		end
+		table.sort(a)
+		for i = 2, 50000 do
+			assert(a[i-1] <= a[i], "not sorted at " .. i)
+		end
+	`)
+}
+
+func TestUnpackLarge(t *testing.T) {
+	// Reproduce the sort.lua test case
+	testString(t, `
+		local unpack = table.unpack
+		local a = {}
+		local lim = 2000
+		for i = 1, lim do a[i] = i end
+		assert(select(lim, unpack(a)) == lim)
+		assert(select('#', unpack(a)) == lim)
+		local x = unpack(a)
+		assert(x == 1)
+		x = {unpack(a)}
+		assert(#x == lim and x[1] == 1 and x[lim] == lim)
+	`)
+}
+
+func TestNextvarMetamethods(t *testing.T) {
+	// Reproduce the nextvar.lua test for table library with metamethods
+	testString(t, `
+		local function test(proxy, t)
+			for i = 1, 10 do
+				table.insert(proxy, 1, i)
+			end
+			assert(#proxy == 10 and #t == 10)
+			for i = 1, 10 do
+				assert(t[i] == 11 - i)
+			end
+			table.sort(proxy)
+			for i = 1, 10 do
+				assert(t[i] == i and proxy[i] == i)
+			end
+			assert(table.concat(proxy, ",") == "1,2,3,4,5,6,7,8,9,10")
+			for i = 1, 8 do
+				assert(table.remove(proxy, 1) == i)
+			end
+			assert(#proxy == 2 and #t == 2)
+			local a, b, c = table.unpack(proxy)
+			assert(a == 9 and b == 10 and c == nil)
+		end
+
+		-- all virtual
+		local t = {}
+		local proxy = setmetatable({}, {
+			__len = function () return #t end,
+			__index = t,
+			__newindex = t,
+		})
+		test(proxy, t)
 	`)
 }
