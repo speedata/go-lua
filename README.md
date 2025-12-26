@@ -85,27 +85,30 @@ lua.DoString(l, `print(add(2, 3))`) // Output: 5
 
 ### Lua 5.3 Compatibility
 
-This implementation passes **7 of 10 core Lua 5.3 test suites**:
+This implementation passes **12 of 13 core Lua 5.3 test suites**:
 
 | Test | Status |
 |------|--------|
+| bitwise | ✅ Pass |
+| code | ✅ Pass |
+| constructs | ✅ Pass |
 | events | ✅ Pass |
 | goto | ✅ Pass |
 | locals | ✅ Pass |
+| math | ✅ Pass |
 | pm (pattern matching) | ✅ Pass |
+| sort | ✅ Pass |
 | tpack (string.pack) | ✅ Pass |
 | utf8 | ✅ Pass |
 | vararg | ✅ Pass |
-| math | ⚠️ Minor differences in error messages |
-| sort | ⚠️ Error handling edge case |
 | strings | ⚠️ Requires coroutines |
 
 ### Known Limitations
 
-- **No coroutines**: `coroutine.*` functions are not implemented. This is a fundamental limitation due to Go's execution model.
-- **No weak references**: Go's garbage collector doesn't support weak references.
+- **No coroutines**: `coroutine.*` functions are not implemented.
+- **No weak references**: Lua's weak tables (`__mode`) are not implemented.
 - **No `string.dump`**: Serializing functions to bytecode is not supported.
-- **No C libraries**: Pure Go implementation cannot load C Lua libraries.
+- **No C libraries**: C Lua libraries are incompatible with this pure Go implementation.
 
 ### What Works Well
 
