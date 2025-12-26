@@ -26,9 +26,11 @@ local a = f(10)
 -- force a GC in this level
 local x = {[1] = {}}   -- to detect a GC
 setmetatable(x, {__mode = 'kv'})
-while x[1] do   -- repeat until GC
-  local a = A..A..A..A  -- create garbage
-  A = A+1
+if not _noweakref then
+  while x[1] do   -- repeat until GC
+    local a = A..A..A..A  -- create garbage
+    A = A+1
+  end
 end
 assert(a[1]() == 20+A)
 assert(a[1]() == 30+A)

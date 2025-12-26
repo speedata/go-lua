@@ -60,7 +60,7 @@ func TestLua(t *testing.T) {
 		// {name: "big"},         // EXTRAARG handling issue with large (>2^18 element) tables
 		{name: "bitwise"},
 		// {name: "calls"},       // Requires debug.getinfo
-		// {name: "closure"},     // Hangs - needs investigation
+		{name: "closure"},
 		{name: "code"},
 		{name: "constructs"},
 		// {name: "coroutine"},   // Coroutines not implemented
@@ -90,7 +90,7 @@ func TestLua(t *testing.T) {
 		t.Log(v)
 		l := NewState()
 		OpenLibraries(l)
-		for _, s := range []string{"_port", "_no32", "_noformatA"} {
+		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref"} {
 			l.PushBoolean(true)
 			l.SetGlobal(s)
 		}
