@@ -49,6 +49,24 @@ func intPairs(l *State) int {
 	return 2
 }
 
+// ipairsKey is a unique key for storing the cached ipairs iterator in the registry
+var ipairsKey = &struct{ name string }{"ipairs iterator"}
+
+// ipairsAux returns the cached ipairs iterator function from the registry,
+// creating and caching it on first use. This ensures ipairs{} == ipairs{}.
+func ipairsAux(l *State) {
+	l.PushLightUserData(ipairsKey)
+	l.RawGet(RegistryIndex)
+	if l.IsNil(-1) {
+		l.Pop(1)
+		// First time: create and cache the iterator
+		l.PushGoFunction(intPairs)
+		l.PushLightUserData(ipairsKey)
+		l.PushValue(-2) // copy the function
+		l.RawSet(RegistryIndex)
+	}
+}
+
 func finishProtectedCall(l *State, status bool) int {
 	if !l.CheckStack(1) {
 		l.SetTop(0) // create space for return values
@@ -171,7 +189,19 @@ var baseLibrary = []RegistryFunction{
 		MetaField(l, 1, "__metatable")
 		return 1
 	}},
-	{"ipairs", pairs("__ipairs", true, intPairs)},
+	{"ipairs", func(l *State) int {
+		// Check for __ipairs metamethod first
+		if hasMetamethod := MetaField(l, 1, "__ipairs"); !hasMetamethod {
+			CheckType(l, 1, TypeTable)
+			ipairsAux(l)   // push cached iterator function
+			l.PushValue(1) // state (the table)
+			l.PushInteger(0) // initial value
+		} else {
+			l.PushValue(1)
+			l.Call(1, 3)
+		}
+		return 3
+	}},
 	{"loadfile", func(l *State) int {
 		f, m, e := OptString(l, 1, ""), OptString(l, 2, ""), 3
 		if l.IsNone(e) {
