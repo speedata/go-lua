@@ -1129,3 +1129,59 @@ func TestNextvarMetamethods(t *testing.T) {
 		test(proxy, t)
 	`)
 }
+
+func TestLargeTableExtraArg(t *testing.T) {
+	// Test large tables that require EXTRAARG instruction
+	// Constants with index > maxIndexRK (255) require opLoadConstant
+	// Constants with index > maxArgBx (2^18-1 = 262143) require EXTRAARG with opLoadConstantEx
+	testString(t, `
+		local function testTable(lim)
+			local prog = { "local y = {0" }
+			for i = 1, lim do prog[#prog + 1] = i end
+			prog[#prog + 1] = "}\n"
+			prog[#prog + 1] = "return y"
+			prog = table.concat(prog, ";")
+
+			local f, err = load(prog)
+			if not f then
+				print("Load error at lim =", lim, ":", err)
+				return false
+			end
+			local ok, result = pcall(f)
+			if not ok then
+				print("Execution error at lim =", lim, ":", result)
+				return false
+			end
+			if result[1] ~= 0 then
+				print("y[1] wrong at lim =", lim, "got", result[1])
+				return false
+			end
+			if result[lim] ~= lim - 1 then
+				print("y[lim] wrong at lim =", lim, "got", result[lim], "expected", lim-1)
+				return false
+			end
+			if result[lim + 1] ~= lim then
+				print("y[lim+1] wrong at lim =", lim, "got", result[lim+1], "expected", lim)
+				return false
+			end
+			return true
+		end
+
+		-- Test at different boundaries
+		print("Testing at 25560 (just past c=511 boundary for opSetList)...")
+		assert(testTable(25560), "failed at 25560")
+		print("OK")
+
+		print("Testing at 262150 (just past maxArgBx for opLoadConstantEx)...")
+		assert(testTable(262150), "failed at 262150")
+		print("OK")
+
+		-- This is the big.lua test case (without coroutines)
+		print("Testing at 2^18 + 1000 (big.lua test case)...")
+		local lim = 2^18 + 1000
+		assert(testTable(lim), "failed at 2^18 + 1000")
+		print("OK")
+
+		print "All tests passed!"
+	`)
+}

@@ -358,7 +358,9 @@ func (f *function) EncodeConstant(r, constant int) int {
 	if constant <= maxArgBx {
 		return f.encodeABx(opLoadConstant, r, constant)
 	}
-	pc := f.encodeABx(opLoadConstant, r, 0)
+	// Use opLoadConstantEx (LOADKX) for constants with index > maxArgBx
+	// The constant index is stored in the following EXTRAARG instruction
+	pc := f.encodeABx(opLoadConstantEx, r, 0)
 	f.encodeExtraArg(constant)
 	return pc
 }
