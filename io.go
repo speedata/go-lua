@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"strings"
 )
 
@@ -417,7 +418,76 @@ var ioLibrary = []RegistryFunction{
 		return FileResult(l, err, name)
 	}},
 	{"output", ioFileHelper(output, "w")},
-	{"popen", func(l *State) int { Errorf(l, "'popen' not supported"); panic("unreachable") }},
+	{"popen", func(l *State) int {
+		command := CheckString(l, 1)
+		mode := OptString(l, 2, "r")
+
+		// Validate mode
+		if mode != "r" && mode != "w" {
+			ArgumentCheck(l, false, 2, "invalid mode")
+		}
+
+		cmd := exec.Command("sh", "-c", command)
+
+		var f *os.File
+		var err error
+
+		if mode == "r" {
+			// Read mode: capture stdout
+			pr, pw, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				return FileResult(l, pipeErr, command)
+			}
+			cmd.Stdout = pw
+			cmd.Stderr = os.Stderr
+			err = cmd.Start()
+			pw.Close() // Close write end in parent
+			if err != nil {
+				pr.Close()
+				return FileResult(l, err, command)
+			}
+			f = pr
+		} else {
+			// Write mode: pipe to stdin
+			pr, pw, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				return FileResult(l, pipeErr, command)
+			}
+			cmd.Stdin = pr
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err = cmd.Start()
+			pr.Close() // Close read end in parent
+			if err != nil {
+				pw.Close()
+				return FileResult(l, err, command)
+			}
+			f = pw
+		}
+
+		// Create stream with custom close that waits for command
+		s := &stream{f: f, close: func(l *State) int {
+			s := toStream(l)
+			s.f.Close()
+			err := cmd.Wait()
+			if err != nil {
+				// Return nil, error message, exit code
+				l.PushNil()
+				l.PushString(err.Error())
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					l.PushInteger(exitErr.ExitCode())
+				} else {
+					l.PushInteger(-1)
+				}
+				return 3
+			}
+			l.PushBoolean(true)
+			return 1
+		}}
+		l.PushUserData(s)
+		SetMetaTableNamed(l, fileHandle)
+		return 1
+	}},
 	{"read", func(l *State) int { return read(l, ioFile(l, input), 1) }},
 	{"tmpfile", func(l *State) int {
 		s := newFile(l)
