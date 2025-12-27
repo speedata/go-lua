@@ -3,7 +3,6 @@ package lua
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -235,7 +234,7 @@ func readLineFromFile(l *State, f *os.File, keepEOL bool) bool {
 
 // readAll reads the entire file from current position.
 func readAll(l *State, f *os.File) bool {
-	data, err := ioutil.ReadAll(f)
+	data, err := io.ReadAll(f)
 	if err != nil && err != io.EOF {
 		l.PushNil()
 		return false
@@ -427,7 +426,16 @@ var ioLibrary = []RegistryFunction{
 			ArgumentCheck(l, false, 2, "invalid mode")
 		}
 
-		cmd := exec.Command("sh", "-c", command)
+		cmd := exec.Command("/bin/sh", "-c", command)
+		// Inherit environment but ensure PATH includes standard locations
+		env := os.Environ()
+		for i, e := range env {
+			if len(e) > 5 && e[:5] == "PATH=" {
+				env[i] = e + ":/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+				break
+			}
+		}
+		cmd.Env = env
 
 		var f *os.File
 		var err error
@@ -491,7 +499,7 @@ var ioLibrary = []RegistryFunction{
 	{"read", func(l *State) int { return read(l, ioFile(l, input), 1) }},
 	{"tmpfile", func(l *State) int {
 		s := newFile(l)
-		f, err := ioutil.TempFile("", "")
+		f, err := os.CreateTemp("", "")
 		if err == nil {
 			s.f = f
 			return 1
