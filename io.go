@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"strings"
 )
 
 const (
@@ -91,10 +92,12 @@ func close(l *State) int {
 	return closeHelper(l)
 }
 
-func write(l *State, f *os.File, argIndex int) int {
+func write(l *State, f *os.File, argIndex, argCount int) int {
 	var err error
-	for argCount := l.Top(); argIndex < argCount && err == nil; argIndex++ {
-		if n, ok := l.ToNumber(argIndex); ok {
+	for ; argIndex <= argCount && err == nil; argIndex++ {
+		// Only convert actual numbers to string, not strings that look like numbers
+		if l.TypeOf(argIndex) == TypeNumber {
+			n, _ := l.ToNumber(argIndex)
 			_, err = f.WriteString(numberToString(n))
 		} else {
 			_, err = f.WriteString(CheckString(l, argIndex))
@@ -106,33 +109,218 @@ func write(l *State, f *os.File, argIndex int) int {
 	return FileResult(l, err, "")
 }
 
-func readNumber(l *State, f *os.File) (err error) {
-	var n float64
-	if _, err = fmt.Fscanf(f, "%f", &n); err == nil {
-		l.PushNumber(n)
-	} else {
-		l.PushNil()
+// readNumber reads a number from file, supporting integers, floats, and hex formats.
+func readNumber(l *State, f *os.File) bool {
+	// Skip whitespace
+	buf := make([]byte, 1)
+	for {
+		n, err := f.Read(buf)
+		if n == 0 || err != nil {
+			l.PushNil()
+			return false
+		}
+		b := buf[0]
+		if b != ' ' && b != '\t' && b != '\n' && b != '\r' && b != '\f' && b != '\v' {
+			f.Seek(-1, io.SeekCurrent)
+			break
+		}
 	}
-	return
+
+	// Read the number string character by character
+	var sb strings.Builder
+	isHex := false
+	hasDigit := false
+	lastWasExp := false
+
+	for {
+		n, err := f.Read(buf)
+		if n == 0 || err != nil {
+			break
+		}
+		b := buf[0]
+
+		// Check if this character can be part of a number
+		canAdd := false
+		if sb.Len() == 0 && (b == '+' || b == '-') {
+			canAdd = true
+		} else if !isHex && sb.Len() == 1 && (sb.String() == "0" || sb.String() == "+0" || sb.String() == "-0") && (b == 'x' || b == 'X') {
+			canAdd = true
+			isHex = true
+		} else if b >= '0' && b <= '9' {
+			canAdd = true
+			hasDigit = true
+			lastWasExp = false
+		} else if isHex && ((b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
+			canAdd = true
+			hasDigit = true
+			lastWasExp = false
+		} else if b == '.' && !isHex {
+			canAdd = true
+			lastWasExp = false
+		} else if (b == 'e' || b == 'E') && !isHex && hasDigit {
+			canAdd = true
+			lastWasExp = true
+		} else if (b == 'p' || b == 'P') && isHex && hasDigit {
+			canAdd = true
+			lastWasExp = true
+		} else if (b == '+' || b == '-') && lastWasExp {
+			canAdd = true
+			lastWasExp = false
+		} else if b == '.' && isHex {
+			// Hex floats can have decimal points
+			canAdd = true
+			lastWasExp = false
+		}
+
+		if canAdd {
+			sb.WriteByte(b)
+		} else {
+			// Put the character back and stop
+			f.Seek(-1, io.SeekCurrent)
+			break
+		}
+	}
+
+	if !hasDigit {
+		l.PushNil()
+		return false
+	}
+
+	// Try to parse as number
+	s := sb.String()
+	intVal, floatVal, isInt, ok := l.parseNumberEx(s)
+	if ok {
+		if isInt {
+			l.PushInteger(int(intVal))
+		} else {
+			l.PushNumber(floatVal)
+		}
+		return true
+	}
+	l.PushNil()
+	return false
+}
+
+// readLine reads a line from file. If keepEOL is true, keeps the end-of-line character.
+func readLineFromFile(l *State, f *os.File, keepEOL bool) bool {
+	var sb strings.Builder
+	buf := make([]byte, 1)
+	hasContent := false
+
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			hasContent = true
+			if buf[0] == '\n' {
+				if keepEOL {
+					sb.WriteByte('\n')
+				}
+				break
+			}
+			sb.WriteByte(buf[0])
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if hasContent {
+		l.PushString(sb.String())
+		return true
+	}
+	l.PushNil()
+	return false
+}
+
+// readAll reads the entire file from current position.
+func readAll(l *State, f *os.File) bool {
+	data, err := ioutil.ReadAll(f)
+	if err != nil && err != io.EOF {
+		l.PushNil()
+		return false
+	}
+	l.PushString(string(data))
+	return true
+}
+
+// readBytes reads up to n bytes from file.
+func readBytes(l *State, f *os.File, n int) bool {
+	if n == 0 {
+		// Special case: read(0) tests for EOF
+		buf := make([]byte, 1)
+		count, err := f.Read(buf)
+		if count > 0 {
+			f.Seek(-1, io.SeekCurrent) // Put the byte back
+			l.PushString("")
+			return true
+		}
+		if err == io.EOF {
+			l.PushNil()
+			return false
+		}
+		l.PushString("")
+		return true
+	}
+
+	buf := make([]byte, n)
+	count, err := f.Read(buf)
+	if count > 0 {
+		l.PushString(string(buf[:count]))
+		return true
+	}
+	if err == io.EOF {
+		l.PushNil()
+		return false
+	}
+	l.PushNil()
+	return false
+}
+
+// readOne reads one item based on the format specifier.
+// Returns true if successful, false on EOF or error.
+func readOne(l *State, f *os.File, argIndex int) bool {
+	if n, ok := l.ToInteger(argIndex); ok {
+		return readBytes(l, f, int(n))
+	}
+
+	format := OptString(l, argIndex, "l")
+	// Handle optional leading '*' (Lua 5.2 compatibility)
+	if len(format) > 0 && format[0] == '*' {
+		format = format[1:]
+	}
+
+	switch format {
+	case "n":
+		return readNumber(l, f)
+	case "l":
+		return readLineFromFile(l, f, false)
+	case "L":
+		return readLineFromFile(l, f, true)
+	case "a":
+		return readAll(l, f)
+	default:
+		Errorf(l, "invalid format")
+		return false
+	}
 }
 
 func read(l *State, f *os.File, argIndex int) int {
-	resultCount := 0
-	var err error
-	if argCount := l.Top() - 1; argCount == 0 {
-		//		err = readLineHelper(l, f, true)
-		resultCount = argIndex + 1
-	} else {
-		// TODO
+	argCount := l.Top()
+	if argCount < argIndex {
+		// No arguments: default is "l" (read line)
+		argCount = argIndex
+		l.PushString("l")
 	}
-	// if err != nil {
-	// 	return FileResult(l, err, "")
-	// }
-	if err == io.EOF {
-		l.Pop(1)
-		l.PushNil()
+
+	first := argIndex
+	for ; argIndex <= argCount; argIndex++ {
+		if !readOne(l, f, argIndex) {
+			// EOF or error: return results so far, with nil for this one
+			break
+		}
 	}
-	return resultCount - argIndex
+
+	return argIndex - first
 }
 
 func readLine(l *State) int {
@@ -251,7 +439,7 @@ var ioLibrary = []RegistryFunction{
 		}
 		return 1
 	}},
-	{"write", func(l *State) int { return write(l, ioFile(l, output), 1) }},
+	{"write", func(l *State) int { return write(l, ioFile(l, output), 1, l.Top()) }},
 }
 
 var fileHandleMethods = []RegistryFunction{
@@ -280,7 +468,12 @@ var fileHandleMethods = []RegistryFunction{
 		// TODO err := setvbuf(f, nil, mode[op], size)
 		return FileResult(l, nil, "")
 	}},
-	{"write", func(l *State) int { l.PushValue(1); return write(l, toFile(l), 2) }},
+	{"write", func(l *State) int {
+		f := toFile(l)
+		n := l.Top()
+		l.PushValue(1)
+		return write(l, f, 2, n)
+	}},
 	//	{"__gc", },
 	{"__tostring", func(l *State) int {
 		if s := toStream(l); s.close == nil {
