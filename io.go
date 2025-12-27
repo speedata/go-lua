@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -426,16 +427,21 @@ var ioLibrary = []RegistryFunction{
 			ArgumentCheck(l, false, 2, "invalid mode")
 		}
 
-		cmd := exec.Command("/bin/sh", "-c", command)
-		// Inherit environment but ensure PATH includes standard locations
-		env := os.Environ()
-		for i, e := range env {
-			if len(e) > 5 && e[:5] == "PATH=" {
-				env[i] = e + ":/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-				break
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/c", command)
+		} else {
+			cmd = exec.Command("/bin/sh", "-c", command)
+			// Ensure PATH includes standard locations on Unix
+			env := os.Environ()
+			for i, e := range env {
+				if len(e) > 5 && e[:5] == "PATH=" {
+					env[i] = e + ":/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+					break
+				}
 			}
+			cmd.Env = env
 		}
-		cmd.Env = env
 
 		var f *os.File
 		var err error
