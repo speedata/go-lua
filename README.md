@@ -86,11 +86,12 @@ lua.DoString(l, `print(add(2, 3))`) // Output: 5
 
 ### Lua 5.3 Compatibility
 
-This implementation passes **12 of 13 core Lua 5.3 test suites**:
+This implementation passes **14 of the Lua 5.3 test suites**:
 
 | Test | Status |
 |------|--------|
 | bitwise | ✅ Pass |
+| closure | ✅ Pass |
 | code | ✅ Pass |
 | constructs | ✅ Pass |
 | events | ✅ Pass |
@@ -99,10 +100,10 @@ This implementation passes **12 of 13 core Lua 5.3 test suites**:
 | math | ✅ Pass |
 | pm (pattern matching) | ✅ Pass |
 | sort | ✅ Pass |
+| strings | ✅ Pass |
 | tpack (string.pack) | ✅ Pass |
 | utf8 | ✅ Pass |
 | vararg | ✅ Pass |
-| strings | ⚠️ Requires coroutines |
 
 ### Known Limitations
 
@@ -124,20 +125,17 @@ This implementation passes **12 of 13 core Lua 5.3 test suites**:
 ## Development
 
 ```sh
-# Clone with test submodule
-git clone --recursive https://github.com/speedata/go-lua.git
-
-# Or initialize submodule after cloning
-git submodule update --init
+# Clone
+git clone https://github.com/speedata/go-lua.git
 
 # Build
 go build
 
-# Run tests (requires luac 5.3 in PATH)
-PATH="$PWD/lua-5.3.6/src:$PATH" go test -v ./...
+# Run tests
+go test -v ./...
 
-# Build luac 5.3 if needed
-cd lua-5.3.6 && make macosx  # or: make linux
+# Some tests (undump, dump, parser) optionally use luac 5.3.
+# If luac is not in PATH, those tests are skipped automatically.
 ```
 
 ## Performance
