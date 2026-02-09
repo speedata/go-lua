@@ -96,7 +96,7 @@ collectgarbage()  -- file should be closed by GC
 assert(io.input() == io.stdin and rawequal(io.output(), io.stdout))
 print('+')
 
--- test GC for files
+if not _noGC then  -- test GC for files
 collectgarbage()
 for i=1,120 do
   for i=1,5 do
@@ -105,6 +105,7 @@ for i=1,120 do
     io.lines(file)
   end
   collectgarbage()
+end
 end
 
 io.input():close()
@@ -138,7 +139,7 @@ assert(f:read("*n") == -0xABCp-3)            -- test old format (with '*')
 assert(f:close())
 assert(os.remove(file))
 
--- test yielding during 'dofile'
+if not _nocoroutine then  -- test yielding during 'dofile'
 f = assert(io.open(file, "w"))
 f:write[[
 local x, z = coroutine.yield(10)
@@ -151,6 +152,7 @@ assert(f(file) == 10)
 print(f(100, 101) == 20)
 assert(f(200) == 100 + 200 * 101)
 assert(os.remove(file))
+end
 
 
 f = assert(io.open(file, "w"))
@@ -459,7 +461,7 @@ testloadfile("\xEF\xBB\xBF", nil)   -- empty file with a BOM
 testloadfile("# a comment\nreturn require'debug'.getinfo(1).currentline", 2)
 
 
--- loading binary file
+if not _noStringDump then  -- loading binary file
 io.output(io.open(file, "wb"))
 assert(io.write(string.dump(function () return 10, '\0alo\255', 'hi' end)))
 io.close()
@@ -486,6 +488,7 @@ io.close()
 a, b, c = assert(loadfile(file))()
 assert(a == 20 and b == "\0\0\0" and c == nil)
 assert(os.remove(file))
+end
 
 
 -- 'loadfile' with 'env'
@@ -575,7 +578,7 @@ and the rest of the file
 assert(os.remove(file))
 collectgarbage()
 
--- testing buffers
+if not _noBuffering then  -- testing buffers
 do
   local f = assert(io.open(file, "w"))
   local fr = assert(io.open(file, "r"))
@@ -600,6 +603,7 @@ do
   assert(fr:read("all") == "xa\n")  -- now we have a whole line
   f:close(); fr:close()
   assert(os.remove(file))
+end
 end
 
 

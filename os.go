@@ -10,13 +10,28 @@ import (
 
 func field(l *State, key string, def int) int {
 	l.Field(-1, key)
-	r, ok := l.ToInteger(-1)
-	if !ok {
+	if l.IsNoneOrNil(-1) {
+		l.Pop(1)
 		if def < 0 {
 			Errorf(l, "field '%s' missing in date table", key)
 		}
-		r = def
+		return def
 	}
+	// Lua 5.3: field must be an exact integer (not a float or non-numeric string)
+	if !l.IsInteger(-1) {
+		// Try to get as number and check if it's a whole number
+		if n, ok := l.ToNumber(-1); ok {
+			if n != float64(int64(n)) {
+				l.Pop(1)
+				Errorf(l, "field '%s' is not an integer", key)
+			}
+			l.Pop(1)
+			return int(int64(n))
+		}
+		l.Pop(1)
+		Errorf(l, "field '%s' is not an integer", key)
+	}
+	r, _ := l.ToInteger(-1)
 	l.Pop(1)
 	return r
 }
@@ -246,11 +261,17 @@ var osLibrary = []RegistryFunction{
 	{"getenv", func(l *State) int { l.PushString(os.Getenv(CheckString(l, 1))); return 1 }},
 	{"remove", func(l *State) int { name := CheckString(l, 1); return FileResult(l, os.Remove(name), name) }},
 	{"rename", func(l *State) int { return FileResult(l, os.Rename(CheckString(l, 1), CheckString(l, 2)), "") }},
-	// {"setlocale", func(l *State) int {
-	// 	op := CheckOption(l, 2, "all", []string{"all", "collate", "ctype", "monetary", "numeric", "time"})
-	// 	l.PushString(setlocale([]int{LC_ALL, LC_COLLATE, LC_CTYPE, LC_MONETARY, LC_NUMERIC, LC_TIME}, OptString(l, 1, "")))
-	// 	return 1
-	// }},
+	{"setlocale", func(l *State) int {
+		// Go has no C-style locale support. Only "C" locale is supported.
+		_ = CheckOption(l, 2, "all", []string{"all", "collate", "ctype", "monetary", "numeric", "time"})
+		locale := OptString(l, 1, "")
+		if locale == "" || locale == "C" || locale == "POSIX" {
+			l.PushString("C")
+		} else {
+			l.PushNil() // unsupported locale
+		}
+		return 1
+	}},
 	{"time", func(l *State) int {
 		if l.IsNoneOrNil(1) {
 			l.PushNumber(float64(time.Now().Unix()))
@@ -263,7 +284,23 @@ var osLibrary = []RegistryFunction{
 			hour := field(l, "hour", 12)
 			min := field(l, "min", 0)
 			sec := field(l, "sec", 0)
-			l.PushNumber(float64(time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local).Unix()))
+			t := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
+			l.PushNumber(float64(t.Unix()))
+			// Since Lua 5.3.3: normalize table fields
+			setField := func(key string, val int) {
+				l.PushInteger(val)
+				l.SetField(1, key)
+			}
+			setField("sec", t.Second())
+			setField("min", t.Minute())
+			setField("hour", t.Hour())
+			setField("day", t.Day())
+			setField("month", int(t.Month()))
+			setField("year", t.Year())
+			setField("wday", int(t.Weekday())+1)
+			setField("yday", t.YearDay())
+			l.PushBoolean(t.IsDST())
+			l.SetField(1, "isdst")
 		}
 		return 1
 	}},

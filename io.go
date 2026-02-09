@@ -96,8 +96,10 @@ func close(l *State) int {
 func write(l *State, f *os.File, argIndex, argCount int) int {
 	var err error
 	for ; argIndex <= argCount && err == nil; argIndex++ {
-		// Only convert actual numbers to string, not strings that look like numbers
-		if l.TypeOf(argIndex) == TypeNumber {
+		if l.IsInteger(argIndex) {
+			i, _ := l.ToInteger(argIndex)
+			_, err = f.WriteString(integerToString(int64(i)))
+		} else if l.TypeOf(argIndex) == TypeNumber {
 			n, _ := l.ToNumber(argIndex)
 			_, err = f.WriteString(numberToString(n))
 		} else {
@@ -128,10 +130,12 @@ func readNumber(l *State, f *os.File) bool {
 	}
 
 	// Read the number string character by character
+	const maxNumberLen = 200 // Lua's limit on number string length
 	var sb strings.Builder
 	isHex := false
 	hasDigit := false
 	lastWasExp := false
+	hasExp := false
 
 	for {
 		n, err := f.Read(buf)
@@ -144,37 +148,40 @@ func readNumber(l *State, f *os.File) bool {
 		canAdd := false
 		if sb.Len() == 0 && (b == '+' || b == '-') {
 			canAdd = true
-		} else if !isHex && sb.Len() == 1 && (sb.String() == "0" || sb.String() == "+0" || sb.String() == "-0") && (b == 'x' || b == 'X') {
+		} else if !isHex && (sb.Len() == 1 || sb.Len() == 2) && (sb.String() == "0" || sb.String() == "+0" || sb.String() == "-0") && (b == 'x' || b == 'X') {
 			canAdd = true
 			isHex = true
 		} else if b >= '0' && b <= '9' {
 			canAdd = true
 			hasDigit = true
 			lastWasExp = false
-		} else if isHex && ((b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
+		} else if isHex && !hasExp && ((b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
 			canAdd = true
 			hasDigit = true
 			lastWasExp = false
-		} else if b == '.' && !isHex {
+		} else if b == '.' {
 			canAdd = true
 			lastWasExp = false
-		} else if (b == 'e' || b == 'E') && !isHex && hasDigit {
+		} else if (b == 'e' || b == 'E') && !isHex && hasDigit && !hasExp {
 			canAdd = true
 			lastWasExp = true
-		} else if (b == 'p' || b == 'P') && isHex && hasDigit {
+			hasExp = true
+		} else if (b == 'p' || b == 'P') && isHex && hasDigit && !hasExp {
 			canAdd = true
 			lastWasExp = true
+			hasExp = true
 		} else if (b == '+' || b == '-') && lastWasExp {
-			canAdd = true
-			lastWasExp = false
-		} else if b == '.' && isHex {
-			// Hex floats can have decimal points
 			canAdd = true
 			lastWasExp = false
 		}
 
 		if canAdd {
 			sb.WriteByte(b)
+			if sb.Len() > maxNumberLen {
+				// Number too long — fail
+				l.PushNil()
+				return false
+			}
 		} else {
 			// Put the character back and stop
 			f.Seek(-1, io.SeekCurrent)
@@ -183,6 +190,7 @@ func readNumber(l *State, f *os.File) bool {
 	}
 
 	if !hasDigit {
+		// Invalid prefix: nothing to unread since we consumed it
 		l.PushNil()
 		return false
 	}
@@ -198,12 +206,13 @@ func readNumber(l *State, f *os.File) bool {
 		}
 		return true
 	}
+	// Consumed characters but couldn't parse — return nil
 	l.PushNil()
 	return false
 }
 
-// readLine reads a line from file. If keepEOL is true, keeps the end-of-line character.
-func readLineFromFile(l *State, f *os.File, keepEOL bool) bool {
+// readLineFromFile reads a line from file. If keepEOL is true, keeps the end-of-line character.
+func readLineFromFile(l *State, f *os.File, keepEOL bool) (bool, error) {
 	var sb strings.Builder
 	buf := make([]byte, 1)
 	hasContent := false
@@ -221,16 +230,19 @@ func readLineFromFile(l *State, f *os.File, keepEOL bool) bool {
 			sb.WriteByte(buf[0])
 		}
 		if err != nil {
+			if err != io.EOF && !hasContent {
+				return false, err
+			}
 			break
 		}
 	}
 
 	if hasContent {
 		l.PushString(sb.String())
-		return true
+		return true, nil
 	}
 	l.PushNil()
-	return false
+	return false, nil
 }
 
 // readAll reads the entire file from current position.
@@ -278,10 +290,10 @@ func readBytes(l *State, f *os.File, n int) bool {
 }
 
 // readOne reads one item based on the format specifier.
-// Returns true if successful, false on EOF or error.
-func readOne(l *State, f *os.File, argIndex int) bool {
+// Returns (true, nil) if successful, (false, nil) on EOF, (false, err) on OS error.
+func readOne(l *State, f *os.File, argIndex int) (bool, error) {
 	if n, ok := l.ToInteger(argIndex); ok {
-		return readBytes(l, f, int(n))
+		return readBytes(l, f, int(n)), nil
 	}
 
 	format := OptString(l, argIndex, "l")
@@ -292,16 +304,16 @@ func readOne(l *State, f *os.File, argIndex int) bool {
 
 	switch format {
 	case "n":
-		return readNumber(l, f)
+		return readNumber(l, f), nil
 	case "l":
 		return readLineFromFile(l, f, false)
 	case "L":
 		return readLineFromFile(l, f, true)
 	case "a":
-		return readAll(l, f)
+		return readAll(l, f), nil
 	default:
 		Errorf(l, "invalid format")
-		return false
+		return false, nil
 	}
 }
 
@@ -315,8 +327,14 @@ func read(l *State, f *os.File, argIndex int) int {
 
 	first := argIndex
 	for ; argIndex <= argCount; argIndex++ {
-		if !readOne(l, f, argIndex) {
-			// EOF or error: return results so far, with nil for this one
+		ok, err := readOne(l, f, argIndex)
+		if err != nil {
+			// OS error: return (nil, message, errno)
+			return FileResult(l, err, "")
+		}
+		if !ok {
+			// EOF: nil was pushed by readOne, count it
+			argIndex++
 			break
 		}
 	}
@@ -353,7 +371,8 @@ func readLine(l *State) int {
 
 func lines(l *State, shouldClose bool) {
 	argCount := l.Top() - 1
-	ArgumentCheck(l, argCount <= MinStack-3, MinStack-3, "too many options")
+	const maxArgLine = 250
+	ArgumentCheck(l, argCount <= maxArgLine, maxArgLine, "too many arguments")
 	l.PushValue(1)
 	l.PushInteger(argCount)
 	l.PushBoolean(shouldClose)
@@ -485,24 +504,31 @@ var ioLibrary = []RegistryFunction{
 			s.f.Close()
 			err := cmd.Wait()
 			if err != nil {
-				// Return nil, error message, exit code
 				l.PushNil()
-				l.PushString(err.Error())
 				if exitErr, ok := err.(*exec.ExitError); ok {
-					l.PushInteger(exitErr.ExitCode())
+					reason, code := exitReasonAndCode(exitErr)
+					l.PushString(reason)
+					l.PushInteger(code)
 				} else {
+					l.PushString("exit")
 					l.PushInteger(-1)
 				}
 				return 3
 			}
 			l.PushBoolean(true)
-			return 1
+			l.PushString("exit")
+			l.PushInteger(0)
+			return 3
 		}}
 		l.PushUserData(s)
 		SetMetaTableNamed(l, fileHandle)
 		return 1
 	}},
-	{"read", func(l *State) int { return read(l, ioFile(l, input), 1) }},
+	{"read", func(l *State) int {
+		f := ioFile(l, input)
+		l.Remove(-1) // remove stream userdata pushed by ioFile
+		return read(l, f, 1)
+	}},
 	{"tmpfile", func(l *State) int {
 		s := newFile(l)
 		f, err := os.CreateTemp("", "")
@@ -523,7 +549,11 @@ var ioLibrary = []RegistryFunction{
 		}
 		return 1
 	}},
-	{"write", func(l *State) int { return write(l, ioFile(l, output), 1, l.Top()) }},
+	{"write", func(l *State) int {
+		top := l.Top()
+		f := ioFile(l, output)
+		return write(l, f, 1, top)
+	}},
 }
 
 var fileHandleMethods = []RegistryFunction{

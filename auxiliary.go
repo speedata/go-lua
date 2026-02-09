@@ -269,6 +269,8 @@ func NewMetaTable(l *State, name string) bool {
 	}
 	l.Pop(1)
 	l.NewTable()
+	l.PushString(name)
+	l.SetField(-2, "__name")
 	l.PushValue(-1)
 	l.SetField(RegistryIndex, name)
 	return true
@@ -421,7 +423,7 @@ func CheckStackWithMessage(l *State, space int, message string) {
 
 func CheckOption(l *State, index int, def string, list []string) int {
 	var name string
-	if def == "" {
+	if def != "" {
 		name = OptString(l, index, def)
 	} else {
 		name = CheckString(l, index)

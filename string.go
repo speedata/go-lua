@@ -1839,7 +1839,16 @@ var stringLibrary = []RegistryFunction{
 		l.PushString(b.String())
 		return 1
 	}},
-	// {"dump", ...},
+	{"dump", func(l *State) int {
+		CheckType(l, 1, TypeFunction)
+		l.SetTop(1)
+		var buf bytes.Buffer
+		if err := l.Dump(&buf); err != nil {
+			Errorf(l, "%s", err.Error())
+		}
+		l.PushString(buf.String())
+		return 1
+	}},
 	{"find", func(l *State) int { return findHelper(l, true) }},
 	{"format", func(l *State) int {
 		l.PushString(formatHelper(l, CheckString(l, 1), l.Top()))

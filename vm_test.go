@@ -68,7 +68,7 @@ func TestLua(t *testing.T) {
 		// {name: "db"},          // Uses coroutines
 		// {name: "errors"},      // Uses coroutines
 		{name: "events"},
-		// {name: "files"},       // File I/O differences
+		{name: "files"},
 		// {name: "gc"},          // GC not controllable in Go
 		{name: "goto"},
 		// {name: "literals"},    // Uses coroutines
@@ -91,7 +91,7 @@ func TestLua(t *testing.T) {
 		t.Log(v)
 		l := NewState()
 		OpenLibraries(l)
-		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_nocoroutine"} {
+		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_nocoroutine", "_noGC", "_noBuffering", "_noStringDump"} {
 			l.PushBoolean(true)
 			l.SetGlobal(s)
 		}
