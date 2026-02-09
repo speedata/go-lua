@@ -1,6 +1,7 @@
 package lua
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -20,9 +21,148 @@ func field(l *State, key string, def int) int {
 	return r
 }
 
+// strftime formats a time according to C strftime-style format specifiers.
+func strftime(format string, t time.Time) (string, error) {
+	var result []byte
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			result = append(result, format[i])
+			continue
+		}
+		i++
+		if i >= len(format) {
+			return "", fmt.Errorf("invalid conversion specifier '%%'")
+		}
+		switch format[i] {
+		case 'a':
+			result = append(result, t.Format("Mon")...)
+		case 'A':
+			result = append(result, t.Format("Monday")...)
+		case 'b', 'h':
+			result = append(result, t.Format("Jan")...)
+		case 'B':
+			result = append(result, t.Format("January")...)
+		case 'c':
+			result = append(result, t.Format("Mon Jan  2 15:04:05 2006")...)
+		case 'd':
+			result = append(result, fmt.Sprintf("%02d", t.Day())...)
+		case 'e':
+			result = append(result, fmt.Sprintf("%2d", t.Day())...)
+		case 'H':
+			result = append(result, fmt.Sprintf("%02d", t.Hour())...)
+		case 'I':
+			h := t.Hour() % 12
+			if h == 0 {
+				h = 12
+			}
+			result = append(result, fmt.Sprintf("%02d", h)...)
+		case 'j':
+			result = append(result, fmt.Sprintf("%03d", t.YearDay())...)
+		case 'm':
+			result = append(result, fmt.Sprintf("%02d", int(t.Month()))...)
+		case 'M':
+			result = append(result, fmt.Sprintf("%02d", t.Minute())...)
+		case 'n':
+			result = append(result, '\n')
+		case 'p':
+			if t.Hour() < 12 {
+				result = append(result, "AM"...)
+			} else {
+				result = append(result, "PM"...)
+			}
+		case 'S':
+			result = append(result, fmt.Sprintf("%02d", t.Second())...)
+		case 't':
+			result = append(result, '\t')
+		case 'U':
+			// Week number (Sunday as first day of week), 00-53
+			yday := t.YearDay()
+			wday := int(t.Weekday())
+			result = append(result, fmt.Sprintf("%02d", (yday+6-wday)/7)...)
+		case 'w':
+			result = append(result, fmt.Sprintf("%d", int(t.Weekday()))...)
+		case 'W':
+			// Week number (Monday as first day of week), 00-53
+			yday := t.YearDay()
+			wday := int(t.Weekday())
+			if wday == 0 {
+				wday = 6
+			} else {
+				wday--
+			}
+			result = append(result, fmt.Sprintf("%02d", (yday+6-wday)/7)...)
+		case 'x':
+			result = append(result, fmt.Sprintf("%02d/%02d/%02d", int(t.Month()), t.Day(), t.Year()%100)...)
+		case 'X':
+			result = append(result, fmt.Sprintf("%02d:%02d:%02d", t.Hour(), t.Minute(), t.Second())...)
+		case 'y':
+			result = append(result, fmt.Sprintf("%02d", t.Year()%100)...)
+		case 'Y':
+			result = append(result, fmt.Sprintf("%04d", t.Year())...)
+		case 'Z':
+			name, _ := t.Zone()
+			result = append(result, name...)
+		case '%':
+			result = append(result, '%')
+		default:
+			return "", fmt.Errorf("invalid conversion specifier '%%%c'", format[i])
+		}
+	}
+	return string(result), nil
+}
+
+func osDate(l *State) int {
+	format := OptString(l, 1, "%c")
+	var t time.Time
+	if l.IsNoneOrNil(2) {
+		t = time.Now()
+	} else {
+		ts := CheckNumber(l, 2)
+		t = time.Unix(int64(ts), 0)
+	}
+
+	// "!" prefix means UTC
+	if len(format) > 0 && format[0] == '!' {
+		format = format[1:]
+		t = t.UTC()
+	}
+
+	// "*t" returns a table
+	if format == "*t" {
+		l.CreateTable(0, 9)
+		l.PushInteger(t.Second())
+		l.SetField(-2, "sec")
+		l.PushInteger(t.Minute())
+		l.SetField(-2, "min")
+		l.PushInteger(t.Hour())
+		l.SetField(-2, "hour")
+		l.PushInteger(t.Day())
+		l.SetField(-2, "day")
+		l.PushInteger(int(t.Month()))
+		l.SetField(-2, "month")
+		l.PushInteger(t.Year())
+		l.SetField(-2, "year")
+		wday := int(t.Weekday()) + 1 // Lua: 1=Sunday, 7=Saturday
+		l.PushInteger(wday)
+		l.SetField(-2, "wday")
+		l.PushInteger(t.YearDay())
+		l.SetField(-2, "yday")
+		l.PushBoolean(t.IsDST())
+		l.SetField(-2, "isdst")
+		return 1
+	}
+
+	result, err := strftime(format, t)
+	if err != nil {
+		Errorf(l, "%s", err.Error())
+	}
+	l.PushString(result)
+	return 1
+}
+
 var osLibrary = []RegistryFunction{
 	{"clock", clock},
-	// {"date", os_date},
+	{"date", osDate},
 	{"difftime", func(l *State) int {
 		l.PushNumber(time.Unix(int64(CheckNumber(l, 1)), 0).Sub(time.Unix(int64(OptNumber(l, 2, 0)), 0)).Seconds())
 		return 1
@@ -117,13 +257,12 @@ var osLibrary = []RegistryFunction{
 		} else {
 			CheckType(l, 1, TypeTable)
 			l.SetTop(1)
-			year := field(l, "year", -1) - 1900
-			month := field(l, "month", -1) - 1
+			year := field(l, "year", -1)
+			month := field(l, "month", -1)
 			day := field(l, "day", -1)
 			hour := field(l, "hour", 12)
 			min := field(l, "min", 0)
 			sec := field(l, "sec", 0)
-			// dst := boolField(l, "isdst") // TODO how to use dst?
 			l.PushNumber(float64(time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local).Unix()))
 		}
 		return 1
