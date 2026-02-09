@@ -368,7 +368,7 @@ end
 
 -- bug in Lua 5.3.2
 -- 'gmatch' iterator does not work across coroutines
-do
+if not _nocoroutine then
   local f = string.gmatch("1 2 3 4 5", "%d+")
   assert(f() == "1")
   co = coroutine.wrap(f)

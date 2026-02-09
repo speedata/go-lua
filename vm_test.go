@@ -91,7 +91,7 @@ func TestLua(t *testing.T) {
 		t.Log(v)
 		l := NewState()
 		OpenLibraries(l)
-		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref"} {
+		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_nocoroutine"} {
 			l.PushBoolean(true)
 			l.SetGlobal(s)
 		}

@@ -88,7 +88,7 @@ func (d *dumpState) writeConstants(p *prototype) {
 			} else {
 				d.writeByte(dumpTLngStr)
 			}
-			d.writeString(v)
+			d.writeStringValue(v)
 		default:
 			d.l.assert(false)
 		}
@@ -112,12 +112,19 @@ func (d *dumpState) writeUpvalues(p *prototype) {
 	}
 }
 
-func (d *dumpState) writeString(s string) {
+func (d *dumpState) writeStringData(s string, allowNull bool) {
 	// Lua 5.3: 1-byte prefix for short strings (1-254), 0xFF + size_t for long
 	ba := []byte(s)
 	size := len(s)
 	if size == 0 {
-		d.writeByte(0)
+		if allowNull {
+			// Write 0x00 to represent a NULL/absent string
+			d.writeByte(0)
+		} else {
+			// Write 0x01 to represent an empty string ""
+			// (size includes conceptual NUL: 0 + 1 = 1)
+			d.writeByte(1)
+		}
 		return
 	}
 	size++ // Size includes conceptual NUL (though not written)
@@ -136,6 +143,18 @@ func (d *dumpState) writeString(s string) {
 		}
 	}
 	d.write(ba)
+}
+
+// writeString writes a string that may be NULL/absent (e.g., source field of
+// child prototypes). An empty Go string is treated as a NULL Lua string.
+func (d *dumpState) writeString(s string) {
+	d.writeStringData(s, true)
+}
+
+// writeStringValue writes a string that is always a real value (e.g., string
+// constants). An empty Go string is written as the Lua empty string "", not NULL.
+func (d *dumpState) writeStringValue(s string) {
+	d.writeStringData(s, false)
 }
 
 func (d *dumpState) writeLocalVariables(p *prototype) {
