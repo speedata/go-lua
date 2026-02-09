@@ -4,3 +4,4 @@ lua-5.3.6/
 luac.out
 *.test
 .claude/
+benchmarks/run-benchmarks
