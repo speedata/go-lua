@@ -26,6 +26,7 @@ var (
 	MemoryError = errors.New("memory error")
 	ErrorError  = errors.New("error within the error handler")
 	FileError   = errors.New("file error")
+	yieldError  = errors.New("yield")
 )
 
 // A RuntimeError is an error raised internally by the Lua VM or through Error.
@@ -194,8 +195,6 @@ type Hook func(state *State, activationRecord Debug)
 // A Function is a Go function intended to be called from Lua.
 type Function func(state *State) int
 
-// TODO XMove(from, to State, n int)
-//
 // Set functions (stack -> Lua)
 // RawSetValue(index int, p interface{})
 //
@@ -203,9 +202,17 @@ type Function func(state *State) int
 // Local(activationRecord *Debug, index int) string
 // SetLocal(activationRecord *Debug, index int) string
 
+type threadStatus byte
+
+const (
+	threadStatusOK    threadStatus = iota
+	threadStatusYield
+	threadStatusDead
+)
+
 type (
 	pc         int
-	callStatus byte
+	callStatus uint16
 )
 
 const (
@@ -217,6 +224,7 @@ const (
 	callStatusError                                     // call has an error status (pcall)
 	callStatusTail                                      // call was tail called
 	callStatusHookYielded                               // last hook called yielded
+	callStatusLEQ                                       // "<=" using "<" (result needs negation)
 )
 
 // A State is an opaque structure representing per thread Lua state.
@@ -241,6 +249,8 @@ type State struct {
 	errorFunction         int      // current error handling function (stack index)
 	baseCallInfo          callInfo // callInfo for first level (go calling lua)
 	protectFunction       func()
+	status                threadStatus
+	caller                *State // the State that called Resume on this thread
 }
 
 type globalState struct {
@@ -399,7 +409,12 @@ func (l *State) ProtectedCallWithContinuation(argCount, resultCount, errorFuncti
 	l.checkResults(argCount, resultCount)
 	if errorFunction != 0 {
 		apiCheckStackIndex(errorFunction, l.indexToValue(errorFunction))
-		errorFunction = l.AbsIndex(errorFunction)
+		// Convert API index to absolute stack index (like C Lua's savestack(index2addr()))
+		if errorFunction > 0 {
+			errorFunction = l.callInfo.function + errorFunction
+		} else if !isPseudoIndex(errorFunction) {
+			errorFunction = l.top + errorFunction
+		}
 	}
 
 	f := l.top - (argCount + 1)
@@ -411,7 +426,7 @@ func (l *State) ProtectedCallWithContinuation(argCount, resultCount, errorFuncti
 		c.continuation, c.context, c.extra, c.oldAllowHook, c.oldErrorFunction = continuation, context, f, l.allowHook, l.errorFunction
 		l.errorFunction = errorFunction
 		l.callInfo.setCallStatus(callStatusYieldableProtected)
-		l.call(f, resultCount, true)
+		err = l.protectedCallYieldable(func() { l.call(f, resultCount, true) }, f, errorFunction)
 		l.callInfo.clearCallStatus(callStatusYieldableProtected)
 		l.errorFunction = c.oldErrorFunction
 	}
@@ -465,6 +480,295 @@ func NewState() *State {
 	g.registry.putAtInt(RegistryIndexGlobals, newTable())
 	copy(g.tagMethodNames[:], eventNames)
 	return l
+}
+
+// NewThread creates a new thread (coroutine), represented as a new State
+// sharing the global environment. The new thread is pushed on the stack of l.
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_newthread
+func (l *State) NewThread() *State {
+	t := &State{allowHook: true, error: nil, nonYieldableCallCount: 0}
+	t.global = l.global
+	t.initializeStack()
+	l.apiPush(t)
+	return t
+}
+
+// XMove exchanges values between different threads of the same global state.
+// This function pops n values from the stack from, and pushes them onto the stack to.
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_xmove
+func XMove(from, to *State, n int) {
+	if from == to {
+		return
+	}
+	from.checkElementCount(n)
+	if apiCheck && from.global != to.global {
+		panic("threads must share the same global state")
+	}
+	to.checkStack(n)
+	from.top -= n
+	copy(to.stack[to.top:to.top+n], from.stack[from.top:from.top+n])
+	to.top += n
+}
+
+// Status returns the status of the thread l.
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_status
+func (l *State) Status() threadStatus {
+	return l.status
+}
+
+// Yield yields the current coroutine. This function should only be called as
+// the return expression of a Go function: return l.Yield(nResults)
+//
+// When a Go function calls Yield, the running coroutine suspends its execution,
+// and the call to Resume that started this coroutine returns.
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_yieldk
+func (l *State) Yield(nResults int) int {
+	if l.nonYieldableCallCount > 0 {
+		if l != l.global.mainThread {
+			l.push("attempt to yield across a Go-call boundary")
+		} else {
+			l.push("attempt to yield from outside a coroutine")
+		}
+		l.errorMessage()
+	}
+	l.status = threadStatusYield
+	// The results to be returned by resume are on top of the stack
+	l.callInfo.extra = l.callInfo.function // save the current function index
+	panic(yieldError)
+}
+
+// Resume starts or continues the execution of coroutine l. To start a coroutine,
+// you push the function plus its arguments onto l's stack, then call Resume with
+// nArgs being the number of arguments. When the coroutine yields or finishes,
+// Resume returns. On return, the stack contains the values passed to Yield or
+// returned by the body function.
+//
+// Resume returns nil on success, or an error if the coroutine raised an error.
+//
+// http://www.lua.org/manual/5.3/manual.html#lua_resume
+func (l *State) Resume(from *State, nArgs int) (err error) {
+	l.caller = from
+	if l.status == threadStatusOK {
+		if l.callInfo != &l.baseCallInfo {
+			l.push("cannot resume non-suspended coroutine")
+			err = RuntimeError("cannot resume non-suspended coroutine")
+			l.caller = nil
+			return
+		}
+	} else if l.status != threadStatusYield {
+		l.push("cannot resume dead coroutine")
+		err = RuntimeError("cannot resume dead coroutine")
+		l.caller = nil
+		return
+	}
+	// Inherit nCcalls from caller (like C Lua) to detect infinite coroutine recursion
+	if from != nil {
+		l.nestedGoCallCount = from.nestedGoCallCount + 1
+	} else {
+		l.nestedGoCallCount = 1
+	}
+	if l.nestedGoCallCount >= maxCallCount {
+		l.push("C stack overflow")
+		err = RuntimeError("C stack overflow")
+		l.caller = nil
+		return
+	}
+	l.nonYieldableCallCount = 0 // allow yields
+	// Run resume in protected mode
+	err = l.resumeRun(nArgs)
+	// Error recovery loop: try to find pcall frames to recover from errors
+	for err != nil {
+		if !l.recoverFromError(err) {
+			// No recovery point - error is fatal
+			l.status = threadStatusDead
+			break
+		}
+		// Run unroll with error status (the recovered pcall frame's
+		// continuation will receive the error)
+		savedErr := err
+		err = nil
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if r == yieldError {
+						return // yield during unroll
+					}
+					if errVal, ok := r.(error); ok {
+						err = errVal
+					} else {
+						err = fmt.Errorf("%v", r)
+					}
+				}
+			}()
+			l.finishCcall(false, savedErr)
+			l.unroll()
+			l.status = threadStatusDead
+		}()
+	}
+	l.caller = nil
+	return
+}
+
+// resumeRun executes the resume logic in a protected context (defer/recover).
+func (l *State) resumeRun(nArgs int) (err error) {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if r == yieldError {
+					return // coroutine yielded successfully
+				}
+				if errVal, ok := r.(error); ok {
+					err = errVal
+				} else {
+					err = fmt.Errorf("%v", r)
+				}
+			}
+		}()
+		if l.status == threadStatusOK {
+			// First resume: call the function
+			function := l.top - (nArgs + 1)
+			if !l.preCall(function, MultipleReturns) {
+				l.execute()
+			}
+		} else {
+			// Re-resume after yield
+			l.status = threadStatusOK
+			ci := l.callInfo
+			if ci.isLua() {
+				// Yielded from within a Lua function via a hook
+				l.finishOp()
+				l.execute()
+			} else {
+				// Yielded from a Go function
+				firstResult := l.top - nArgs
+				if ci.continuation != nil {
+					ci.setCallStatus(callStatusYielded)
+					ci.shouldYield = true
+					n := ci.continuation(l)
+					apiCheckStackSpace(l, n)
+					firstResult = l.top - n
+				}
+				l.postCall(firstResult)
+			}
+			l.unroll()
+		}
+		// Coroutine completed normally
+		l.status = threadStatusDead
+	}()
+	return
+}
+
+// finishOp finishes execution of an opcode interrupted by a yield.
+// It looks at the instruction before savedPC (the interrupted one) and
+// completes any side effects that were not done before the yield.
+func (l *State) finishOp() {
+	ci := l.callInfo
+	inst := ci.code[ci.savedPC-1] // interrupted instruction
+	switch inst.opCode() {
+	case opAdd, opSub, opMul, opDiv, opIDiv,
+		opBAnd, opBOr, opBXor, opShl, opShr,
+		opMod, opPow,
+		opUnaryMinus, opBNot, opLength,
+		opGetTableUp, opGetTable, opSelf:
+		l.top--
+		ci.frame[inst.a()] = l.stack[l.top]
+	case opLessOrEqual, opLessThan, opEqual:
+		res := !isFalse(l.stack[l.top-1])
+		l.top--
+		// "<=" using "<" with swapped args? Negate result.
+		if ci.isCallStatus(callStatusLEQ) {
+			ci.clearCallStatus(callStatusLEQ)
+			res = !res
+		}
+		// The next instruction should be a jump
+		if (res && inst.a() == 0) || (!res && inst.a() != 0) {
+			ci.savedPC++ // skip jump instruction
+		}
+	case opConcat:
+		top := l.top - 1             // position where TM result is
+		b := inst.b()
+		base := ci.base()
+		total := top - 1 - (base + b) // remaining elements to concat
+		l.stack[top-2] = l.stack[top]  // put TM result in proper position
+		if total > 1 {
+			l.top = top - 1
+			l.concat(total) // concat remaining (may yield again)
+		}
+		ci.frame[inst.a()] = l.stack[l.top-1] // move final result
+		l.top = ci.top                         // restore top
+	case opTForCall:
+		l.top = ci.top // correct top
+	case opCall:
+		if inst.c()-1 >= 0 { // nresults >= 0?
+			l.top = ci.top // adjust results
+		}
+	case opTailCall, opSetTableUp, opSetTable:
+		// nothing to do
+	}
+}
+
+// finishCcall finishes execution of a Go function frame after a yield.
+// It calls the continuation function and then postCall to complete the frame.
+// shouldYield=true means normal yield resume, shouldYield=false means error recovery.
+func (l *State) finishCcall(shouldYield bool, status error) {
+	ci := l.callInfo
+	if ci.isCallStatus(callStatusYieldableProtected) {
+		ci.clearCallStatus(callStatusYieldableProtected)
+		l.errorFunction = ci.oldErrorFunction
+	}
+	l.adjustResults(ci.resultCount)
+	ci.setCallStatus(callStatusYielded)
+	ci.shouldYield = shouldYield
+	ci.error = status
+	n := ci.continuation(l)
+	apiCheckStackSpace(l, n)
+	l.postCall(l.top - n)
+}
+
+// findpcall searches the call stack for a yieldable protected call frame.
+func (l *State) findpcall() *callInfo {
+	for ci := l.callInfo; ci != nil; ci = ci.previous {
+		if ci.isCallStatus(callStatusYieldableProtected) {
+			return ci
+		}
+	}
+	return nil
+}
+
+// recoverFromError recovers from an error in a coroutine by finding a
+// yieldable protected call frame (pcall/xpcall with continuation) and
+// resetting state to that frame. Returns true if recovery was possible.
+func (l *State) recoverFromError(status error) bool {
+	ci := l.findpcall()
+	if ci == nil {
+		return false
+	}
+	oldTop := ci.extra
+	l.close(oldTop)
+	l.setErrorObject(status, oldTop)
+	l.callInfo = ci
+	l.allowHook = ci.oldAllowHook
+	l.nonYieldableCallCount = 0
+	l.errorFunction = ci.oldErrorFunction
+	return true
+}
+
+// unroll continues execution after a resume from yield by running
+// all pending frames in the call stack (Lua frames via execute,
+// Go frames via finishCcall).
+func (l *State) unroll() {
+	for l.callInfo != &l.baseCallInfo {
+		if !l.callInfo.isLua() {
+			l.finishCcall(true, nil)
+		} else {
+			l.finishOp()
+			l.execute()
+		}
+	}
 }
 
 func apiCheckStackIndex(index int, v value) {
@@ -783,7 +1087,9 @@ func (l *State) ToInteger(index int) (int, bool) {
 		return int(i), true
 	}
 	if n, ok := l.toNumber(l.indexToValue(index)); ok {
-		return int(n), true
+		if i, ok := floatToInteger(n); ok {
+			return int(i), true
+		}
 	}
 	return 0, false
 }
@@ -794,7 +1100,7 @@ func (l *State) ToInteger64(index int) (int64, bool) {
 		return i, true
 	}
 	if n, ok := l.toNumber(l.indexToValue(index)); ok {
-		return int64(n), true
+		return floatToInteger(n)
 	}
 	return 0, false
 }
@@ -1273,7 +1579,36 @@ func (l *State) protectedCall(f func(), oldTop, errorFunc int) error {
 		l.close(oldTop)
 		l.setErrorObject(err, oldTop)
 		l.callInfo, l.allowHook, l.nonYieldableCallCount = callInfo, allowHook, nonYieldableCallCount
-		// TODO l.shrinkStack()
+		l.shrinkStack()
+	}
+	l.errorFunction = errorFunction
+	return err
+}
+
+// protectedCallYieldable is like protectedCall but allows yield panics to propagate.
+func (l *State) protectedCallYieldable(f func(), oldTop, errorFunc int) (err error) {
+	callInfo, allowHook, nonYieldableCallCount, errorFunction := l.callInfo, l.allowHook, l.nonYieldableCallCount, l.errorFunction
+	l.errorFunction = errorFunc
+	func() {
+		defer func() {
+			if e := recover(); e != nil {
+				// Let yield errors propagate through
+				if e == yieldError {
+					panic(e)
+				}
+				if errVal, ok := e.(error); ok {
+					err = errVal
+				} else {
+					err = fmt.Errorf("%v", e)
+				}
+			}
+		}()
+		f()
+	}()
+	if err != nil {
+		l.close(oldTop)
+		l.setErrorObject(err, oldTop)
+		l.callInfo, l.allowHook, l.nonYieldableCallCount = callInfo, allowHook, nonYieldableCallCount
 	}
 	l.errorFunction = errorFunction
 	return err

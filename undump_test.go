@@ -11,7 +11,7 @@ import (
 )
 
 func TestAllHeaderNoFun(t *testing.T) {
-	expectErrorFromUndump(io.EOF, header, t)
+	expectErrorFromUndump(errTruncated, header, t)
 }
 
 func TestWrongEndian(t *testing.T) {

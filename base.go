@@ -114,6 +114,7 @@ func (r *genericReader) Read(b []byte) (n int, err error) {
 		l.PushValue(1)
 		if l.Call(0, 1); l.IsNil(-1) {
 			l.Pop(1)
+			r.e = io.EOF
 			return 0, io.EOF
 		} else if !l.IsString(-1) {
 			Errorf(l, "reader function must return a string")
@@ -132,13 +133,28 @@ func (r *genericReader) Read(b []byte) (n int, err error) {
 	return
 }
 
+func baseError(l *State) int {
+	level := OptInteger(l, 2, 1)
+	l.SetTop(1)
+	if l.IsString(1) && level > 0 {
+		Where(l, level)
+		l.PushValue(1)
+		l.Concat(2)
+	}
+	l.Error()
+	panic("unreachable")
+}
+
 var baseLibrary = []RegistryFunction{
 	{"assert", func(l *State) int {
-		if !l.ToBoolean(1) {
-			Errorf(l, "%s", OptString(l, 2, "assertion failed!"))
-			panic("unreachable")
+		if l.ToBoolean(1) { // condition is true?
+			return l.Top() // return all arguments
 		}
-		return l.Top()
+		CheckAny(l, 1)
+		l.Remove(1)                         // remove condition
+		l.PushString("assertion failed!")    // default message
+		l.SetTop(1)                         // leave only message (default if no other one)
+		return baseError(l)                 // call 'error'
 	}},
 	{"collectgarbage", func(l *State) int {
 		switch opt, _ := OptString(l, 1, "collect"), OptInteger(l, 2, 0); opt {
@@ -155,7 +171,7 @@ var baseLibrary = []RegistryFunction{
 			l.PushInteger(int(stats.HeapAlloc & 0x3ff))
 			return 2
 		default:
-			l.PushInteger(-1)
+			Errorf(l, "invalid option '%s'", opt)
 		}
 		return 1
 	}},
@@ -170,15 +186,7 @@ var baseLibrary = []RegistryFunction{
 		return continuation(l)
 	}},
 	{"error", func(l *State) int {
-		level := OptInteger(l, 2, 1)
-		l.SetTop(1)
-		if l.IsString(1) && level > 0 {
-			Where(l, level)
-			l.PushValue(1)
-			l.Concat(2)
-		}
-		l.Error()
-		panic("unreachable")
+		return baseError(l)
 	}},
 	{"getmetatable", func(l *State) int {
 		CheckAny(l, 1)

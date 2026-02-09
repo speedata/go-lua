@@ -57,21 +57,21 @@ func TestLua(t *testing.T) {
 		name    string
 		nonPort bool
 	}{
-		// {name: "attrib"},     // Requires coroutine module
+		// {name: "attrib"},     // Requires debug.getinfo, weak references
 		// {name: "big"},         // EXTRAARG handling issue with large (>2^18 element) tables
 		{name: "bitwise"},
-		// {name: "calls"},       // Requires debug.getinfo
+		{name: "calls"},
 		{name: "closure"},
 		{name: "code"},
 		{name: "constructs"},
-		// {name: "coroutine"},   // Coroutines not implemented
-		// {name: "db"},          // Uses coroutines
-		// {name: "errors"},      // Uses coroutines
+		{name: "coroutine"},
+		// {name: "db"},          // Needs debug.getlocal for coroutines, etc.
+		{name: "errors"},
 		{name: "events"},
 		{name: "files"},
 		// {name: "gc"},          // GC not controllable in Go
 		{name: "goto"},
-		// {name: "literals"},    // Uses coroutines
+		{name: "literals"},
 		{name: "locals"},
 		// {name: "main"},        // Requires command-line Lua
 		{name: "math"},
@@ -91,7 +91,7 @@ func TestLua(t *testing.T) {
 		t.Log(v)
 		l := NewState()
 		OpenLibraries(l)
-		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_nocoroutine", "_noGC", "_noBuffering", "_noStringDump"} {
+		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_noGC", "_noBuffering", "_noStringDump"} {
 			l.PushBoolean(true)
 			l.SetGlobal(s)
 		}
@@ -438,7 +438,7 @@ func TestLocIsCorrectOnFuncCall(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error! Got none... :(")
 	} else {
-		if err.Error() != "runtime error: [string \"test\"]:4: attempt to call a nil value" {
+		if err.Error() != "runtime error: [string \"test\"]:4: attempt to call a nil value (global 'isNotDefined')" {
 			t.Errorf("Wrong error reported: %v", err)
 		}
 	}
@@ -456,7 +456,7 @@ func TestLocIsCorrectOnError(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error! Got none... :(")
 	} else {
-		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value" {
+		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value (global 'q')" {
 			t.Errorf("Wrong error reported: %v", err)
 		}
 	}
@@ -1184,4 +1184,116 @@ func TestLargeTableExtraArg(t *testing.T) {
 
 		print "All tests passed!"
 	`)
+}
+
+func TestCoroutineLua(t *testing.T) {
+	testString(t, `
+		-- Basic create/resume/yield
+		local co = coroutine.create(function(a, b)
+			coroutine.yield(a + b, a - b)
+			return a * b
+		end)
+
+		local ok, x, y = coroutine.resume(co, 10, 3)
+		assert(ok == true, "resume should succeed")
+		assert(x == 13, "expected 13, got " .. tostring(x))
+		assert(y == 7, "expected 7, got " .. tostring(y))
+		assert(coroutine.status(co) == "suspended", "expected suspended, got " .. coroutine.status(co))
+
+		local ok2, z = coroutine.resume(co)
+		assert(ok2 == true, "second resume should succeed")
+		assert(z == 30, "expected 30, got " .. tostring(z))
+		assert(coroutine.status(co) == "dead", "expected dead, got " .. coroutine.status(co))
+
+		-- wrap
+		local gen = coroutine.wrap(function()
+			for i = 1, 3 do
+				coroutine.yield(i)
+			end
+		end)
+		assert(gen() == 1)
+		assert(gen() == 2)
+		assert(gen() == 3)
+
+		-- running
+		local main, isMain = coroutine.running()
+		assert(isMain == true, "main thread should be main")
+
+		-- isyieldable
+		assert(coroutine.isyieldable() == false, "main thread should not be yieldable")
+
+		local co2 = coroutine.create(function()
+			assert(coroutine.isyieldable() == true, "coroutine should be yieldable")
+			coroutine.yield()
+		end)
+		coroutine.resume(co2)
+	`)
+}
+
+func TestCoroutineYieldBoundary(t *testing.T) {
+	testString(t, `
+		co = coroutine.wrap(function()
+			assert(not pcall(table.sort, {1,2,3}, coroutine.yield))
+			assert(coroutine.isyieldable())
+			coroutine.yield(20)
+			return 30
+		end)
+		assert(co() == 20)
+		assert(co() == 30)
+	`)
+}
+
+func TestCoroutineYieldInFor(t *testing.T) {
+	testString(t, `
+		local f = function (s, i) return coroutine.yield(i) end
+
+		local f1 = coroutine.wrap(function ()
+			return xpcall(pcall, function (...) return ... end,
+				function ()
+					local s = 0
+					for i in f, nil, 1 do pcall(function () s = s + i end) end
+					error({s})
+				end)
+		end)
+
+		f1()
+		for i = 1, 10 do assert(f1(i) == i) end
+		local r1, r2, v = f1(nil)
+		assert(r1 and not r2 and v[1] == (10 + 1)*10/2)
+	`)
+}
+
+func TestCoroutineBasicGoAPI(t *testing.T) {
+	l := NewState()
+	OpenLibraries(l)
+
+	// Create a coroutine thread
+	co := l.NewThread()
+
+	// Push a Go function that yields
+	co.PushGoFunction(func(l *State) int {
+		l.PushInteger(10)
+		l.PushInteger(20)
+		return l.Yield(2)
+	})
+
+	// First resume: starts the coroutine, Go function yields 10, 20
+	err := co.Resume(l, 0)
+	if err != nil {
+		t.Fatalf("first resume failed: %v", err)
+	}
+	if co.Status() != threadStatusYield {
+		t.Fatalf("expected yield status, got %v", co.Status())
+	}
+
+	// Check yielded values (10, 20) on coroutine stack
+	n := co.Top()
+	if n != 2 {
+		t.Fatalf("expected 2 yielded values, got %d", n)
+	}
+	v1, _ := co.ToInteger(1)
+	v2, _ := co.ToInteger(2)
+	if v1 != 10 || v2 != 20 {
+		t.Fatalf("expected (10, 20), got (%d, %d)", v1, v2)
+	}
 }

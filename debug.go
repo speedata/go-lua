@@ -21,23 +21,38 @@ func chunkID(source string) string {
 	if len(source) == 0 {
 		return "[string \"?\"]"
 	}
+	bufflen := idSize // available characters (including '\0' in C, we use as max length)
 	switch source[0] {
 	case '=': // "literal" source
-		if len(source) <= idSize {
+		if len(source)-1 <= bufflen-1 {
 			return source[1:]
 		}
-		return source[1:idSize]
+		return source[1:bufflen]
 	case '@': // file name
-		if len(source) <= idSize {
+		if len(source)-1 <= bufflen-1 {
 			return source[1:]
 		}
-		return "..." + source[1:idSize-3]
+		// truncate beginning, keep end with "..." prefix
+		rest := bufflen - 1 - 3 // -1 for removing '@', -3 for "..."
+		return "..." + source[len(source)-rest:]
 	}
-	source = strings.Split(source, "\n")[0]
-	if l := len("[string \"...\"]"); len(source) > idSize-l {
-		return "[string \"" + source + "...\"]"
+	// string source: format as [string "source"]
+	nl := strings.IndexByte(source, '\n')
+	pre := "[string \""
+	suf := "\"]"
+	dots := "..."
+	avail := bufflen - len(pre) - len(dots) - len(suf) - 1
+	l := len(source)
+	if l <= avail+len(dots) && nl < 0 { // small one-line source?
+		return pre + source + suf
 	}
-	return "[string \"" + source + "\"]"
+	if nl >= 0 && nl < l {
+		l = nl
+	}
+	if l > avail {
+		l = avail
+	}
+	return pre + source[:l] + dots + suf
 }
 
 func (l *State) runtimeError(message string) {
@@ -54,46 +69,109 @@ func (l *State) runtimeError(message string) {
 	l.errorMessage()
 }
 
+// varInfo finds the variable name and kind for a value in the current Lua frame.
+// Like C Lua's varinfo(), it uses symbolic execution of the bytecode to identify
+// the source of a value. When stackIdx >= 0, it uses exact stack position matching;
+// otherwise it falls back to value comparison for finding the frame slot.
+func (l *State) varInfo(v value, stackIdx int) (kind, name string) {
+	ci := l.callInfo
+	if !ci.isLua() {
+		return
+	}
+	c := l.stack[ci.function].(*luaClosure)
+	currentPC := ci.savedPC - 1
+
+	// Check upvalues by stack identity (like C Lua's getupvalname).
+	// Only works when we know the exact stack slot, because Go interface
+	// comparison can match the wrong upvalue when multiple have the same value.
+	if stackIdx >= 0 {
+		for i, uv := range c.upValues {
+			if home, ok := uv.home.(stackLocation); ok {
+				if home.index == stackIdx {
+					return "upvalue", c.prototype.upValueName(i)
+				}
+			}
+		}
+	}
+
+	// Find register index in frame
+	frameIndex := -1
+	if stackIdx >= 0 {
+		base := ci.base()
+		fi := stackIdx - base
+		if fi >= 0 && fi < len(ci.frame) {
+			frameIndex = fi
+		}
+	} else {
+		for i, e := range ci.frame {
+			if e == v {
+				frameIndex = i
+				break
+			}
+		}
+	}
+	if frameIndex >= 0 {
+		name, kind = c.prototype.objectName(frameIndex, currentPC)
+	}
+
+	// If objectName didn't find anything, check the current instruction
+	// for direct upvalue access (GETTABUP/SETTABUP/GETUPVAL).
+	// This handles the case where the value came directly from an upvalue
+	// and was never stored in a register (Go can't do pointer identity like C).
+	if kind == "" && int(currentPC) < len(c.prototype.code) {
+		instr := c.prototype.code[currentPC]
+		switch instr.opCode() {
+		case opGetTableUp:
+			// GETTABUP A B C: table is upvalue at B
+			return "upvalue", c.prototype.upValueName(instr.b())
+		case opSetTableUp:
+			// SETTABUP A B C: table is upvalue at A
+			return "upvalue", c.prototype.upValueName(instr.a())
+		}
+	}
+	return
+}
+
+// objectTypeName returns the type name for a value, checking __name metafield first.
+func (l *State) objectTypeName(v value) string {
+	var mt *table
+	switch v := v.(type) {
+	case *table:
+		mt = v.metaTable
+	case *userData:
+		mt = v.metaTable
+	}
+	if mt != nil {
+		if name, ok := mt.atString("__name").(string); ok {
+			return name
+		}
+	}
+	return l.valueToType(v).String()
+}
+
 func (l *State) typeError(v value, operation string) {
-	typeName := l.valueToType(v).String()
-	if ci := l.callInfo; ci.isLua() {
-		c := l.stack[ci.function].(*luaClosure)
-		var kind, name string
-		isUpValue := func() bool {
-			for i, uv := range c.upValues {
-				if uv.value() == v {
-					kind, name = "upvalue", c.prototype.upValueName(i)
-					return true
-				}
-			}
-			return false
-		}
-		frameIndex := 0
-		isInStack := func() bool {
-			for i, e := range ci.frame {
-				if e == v {
-					frameIndex = i
-					return true
-				}
-			}
-			return false
-		}
-		if !isUpValue() && isInStack() {
-			name, kind = c.prototype.objectName(frameIndex, ci.savedPC)
-		}
-		if kind != "" {
-			l.runtimeError(fmt.Sprintf("attempt to %s %s '%s' (a %s value)", operation, kind, name, typeName))
-		}
+	typeName := l.objectTypeName(v)
+	if kind, name := l.varInfo(v, -1); kind != "" {
+		l.runtimeError(fmt.Sprintf("attempt to %s a %s value (%s '%s')", operation, typeName, kind, name))
+	}
+	l.runtimeError(fmt.Sprintf("attempt to %s a %s value", operation, typeName))
+}
+
+func (l *State) typeErrorAt(stackIdx int, operation string) {
+	v := l.stack[stackIdx]
+	typeName := l.objectTypeName(v)
+	if kind, name := l.varInfo(v, stackIdx); kind != "" {
+		l.runtimeError(fmt.Sprintf("attempt to %s a %s value (%s '%s')", operation, typeName, kind, name))
 	}
 	l.runtimeError(fmt.Sprintf("attempt to %s a %s value", operation, typeName))
 }
 
 func (l *State) orderError(left, right value) {
-	leftType, rightType := l.valueToType(left).String(), l.valueToType(right).String()
+	leftType, rightType := l.objectTypeName(left), l.objectTypeName(right)
 	if leftType == rightType {
-		l.runtimeError(fmt.Sprintf("attempt to compare two '%s' values", leftType))
+		l.runtimeError(fmt.Sprintf("attempt to compare two %s values", leftType))
 	}
-	l.runtimeError(fmt.Sprintf("attempt to compare '%s' with '%s'", leftType, rightType))
+	l.runtimeError(fmt.Sprintf("attempt to compare %s with %s", leftType, rightType))
 }
 
 func (l *State) arithError(v1, v2 value) {
@@ -157,8 +235,11 @@ func (l *State) bitwiseError(v1, v2 value) {
 		}
 		l.runtimeError("number has no integer representation")
 	}
-	// Otherwise, fall back to standard arithmetic error (for non-numeric types)
-	l.arithError(v1, v2)
+	// Otherwise, report bitwise operation error (for non-numeric types)
+	if _, ok := l.toNumber(v1); !ok {
+		v2 = v1
+	}
+	l.typeError(v2, "perform bitwise operation on")
 }
 
 func (l *State) concatError(v1, v2 value) {
@@ -193,7 +274,12 @@ func (l *State) errorMessage() {
 		l.stack[l.top] = l.stack[l.top-1] // move argument
 		l.stack[l.top-1] = errorFunction  // push function
 		l.top++
-		l.call(l.top-2, 1, false)
+		savedEF := l.errorFunction
+		l.errorFunction = 0 // prevent recursive error handler calls
+		if err := l.protect(func() { l.call(l.top-2, 1, false) }); err != nil {
+			_ = savedEF
+			l.throw(ErrorError) // error in error handler
+		}
 	}
 	// In Lua 5.3, error() can be called with any value, not just strings.
 	// The actual error value stays on the stack and is used by setErrorObject.
@@ -560,8 +646,7 @@ var debugLibrary = []RegistryFunction{
 		} else {
 			hookTable(l)
 			l1.PushThread()
-			//			XMove(l1, l, 1)
-			panic("XMove not implemented yet")
+			XMove(l1, l, 1)
 			l.RawGet(-2)
 			l.Remove(-2)
 		}
@@ -735,8 +820,7 @@ var debugLibrary = []RegistryFunction{
 			l.SetMetaTable(-2)
 		}
 		l1.PushThread()
-		//	 	XMove(l1, l, 1)
-		panic("XMove not yet implemented")
+		XMove(l1, l, 1)
 		l.PushValue(i + 1)
 		l.RawSet(-3)
 		SetDebugHook(l1, hook, mask, count)

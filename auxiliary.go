@@ -175,7 +175,7 @@ func pushGlobalFunctionName(l *State, f Frame) bool {
 }
 
 func typeError(l *State, argCount int, typeName string) {
-	ArgumentError(l, argCount, l.PushString(typeName+" expected, got "+TypeNameOf(l, argCount)))
+	ArgumentError(l, argCount, l.PushString(typeName+" expected, got "+l.objectTypeName(l.indexToValue(argCount))))
 }
 
 func tagError(l *State, argCount int, tag Type) { typeError(l, argCount, tag.String()) }
@@ -368,6 +368,9 @@ func OptNumber(l *State, index int, def float64) float64 {
 func CheckInteger(l *State, index int) int {
 	i, ok := l.ToInteger(index)
 	if !ok {
+		if l.IsNumber(index) {
+			ArgumentError(l, index, "number has no integer representation")
+		}
 		tagError(l, index, TypeNumber)
 	}
 	return i

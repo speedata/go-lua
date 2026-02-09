@@ -386,7 +386,12 @@ func (l *State) lessOrEqual(left, right value) bool {
 	}
 	if result, ok := l.callOrderTagMethod(left, right, tmLE); ok {
 		return result
-	} else if result, ok := l.callOrderTagMethod(right, left, tmLT); ok {
+	}
+	// Fall back to "not (b < a)" using __lt.
+	// Set callStatusLEQ so finishOp knows to negate the result after yield.
+	l.callInfo.setCallStatus(callStatusLEQ)
+	if result, ok := l.callOrderTagMethod(right, left, tmLT); ok {
+		l.callInfo.clearCallStatus(callStatusLEQ)
 		return !result
 	}
 	l.orderError(left, right)
@@ -531,7 +536,7 @@ func (l *State) traceExecution() {
 		callInfo.savedPC--
 		callInfo.setCallStatus(callStatusHookYielded)
 		callInfo.function = l.top - 1
-		panic("Not implemented - use goroutines to emulate yield")
+		l.Yield(0)
 	}
 }
 
@@ -804,7 +809,9 @@ func init() {
 			c := e.k(i.c())
 			// Try integer arithmetic first (Lua 5.3: int % int = int)
 			if ib, ic, ok := integerValues(b, c); ok {
-				// Lua's modulo: a - (a // b) * b (handles negatives correctly)
+				if ic == 0 {
+					e.l.runtimeError("attempt to perform 'n%0'")
+				}
 				e.frame[i.a()] = intMod(ib, ic)
 				if e.hooked() {
 					e.hook()

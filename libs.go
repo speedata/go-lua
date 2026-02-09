@@ -35,7 +35,7 @@ func OpenLibraries(l *State, preloaded ...RegistryFunction) {
 	libs := []RegistryFunction{
 		{"_G", BaseOpen},
 		{"package", PackageOpen},
-		// {"coroutine", CoroutineOpen},
+		{"coroutine", CoroutineOpen},
 		{"table", TableOpen},
 		{"io", IOOpen},
 		{"os", OSOpen},

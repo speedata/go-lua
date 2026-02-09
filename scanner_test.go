@@ -20,7 +20,7 @@ func TestScanner(t *testing.T) {
 		{"=", []token{{t: '='}}},
 		{"==", []token{{t: tkEq}}},
 		{"\"hello, world\"", []token{{t: tkString, s: "hello, world"}}},
-		{"[[hello,\r\nworld]]", []token{{t: tkString, s: "hello,\n\nworld"}}},
+		{"[[hello,\r\nworld]]", []token{{t: tkString, s: "hello,\nworld"}}},
 		{".", []token{{t: '.'}}},
 		{"..", []token{{t: tkConcat}}},
 		{"...", []token{{t: tkDots}}},
@@ -42,15 +42,19 @@ func TestScanner(t *testing.T) {
 	}
 }
 
+func tokenEqual(a, b token) bool {
+	return a.t == b.t && a.n == b.n && a.i == b.i && a.s == b.s
+}
+
 func testScanner(t *testing.T, n int, source string, tokens []token) {
 	s := scanner{r: strings.NewReader(source)}
 	for i, expected := range tokens {
-		if result := s.scan(); result != expected {
+		if result := s.scan(); !tokenEqual(result, expected) {
 			t.Errorf("[%d] expected token %s but found %s at %d", n, expected, result, i)
 		}
 	}
 	expected := token{t: tkEOS}
-	if result := s.scan(); result != expected {
+	if result := s.scan(); !tokenEqual(result, expected) {
 		t.Errorf("[%d] expected token %s but found %s", n, expected, result)
 	}
 }

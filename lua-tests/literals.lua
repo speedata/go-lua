@@ -94,7 +94,7 @@ lexerror([["xyz\300"]], [[\300"]])
 lexerror([["   \256"]], [[\256"]])
 
 -- errors in UTF-8 sequences
-lexerror([["abc\u{110000}"]], [[abc\u{110000]])   -- too large
+lexerror([["abc\u{110000}"]], [["abc\u{110000]])   -- too large
 lexerror([["abc\u11r"]], [[abc\u1]])    -- missing '{'
 lexerror([["abc\u"]], [[abc\u"]])    -- missing '{'
 lexerror([["abc\u{11r"]], [[abc\u{11r]])    -- missing '}'

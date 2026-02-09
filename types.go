@@ -323,7 +323,7 @@ func (p *prototype) constantName(k int, pc pc) string {
 		if s, ok := p.constants[constantIndex(k)].(string); ok {
 			return s
 		}
-	} else if name, kind := p.objectName(k, pc); kind == "c" {
+	} else if name, kind := p.objectName(k, pc); kind == "constant" {
 		return name
 	}
 	return "?"

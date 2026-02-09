@@ -67,10 +67,11 @@ var tokens []string = []string{
 }
 
 type token struct {
-	t rune
-	n float64
-	i int64 // Lua 5.3: integer value
-	s string
+	t   rune
+	n   float64
+	i   int64  // Lua 5.3: integer value
+	s   string
+	raw string // original source text for error messages (txtToken)
 }
 
 type scanner struct {
@@ -81,6 +82,7 @@ type scanner struct {
 	lineNumber, lastLine int
 	source               string
 	lookAheadToken       token
+	tokenBuf             string // last token's buffer content for error messages
 	token
 }
 
@@ -88,29 +90,44 @@ func (s *scanner) assert(cond bool)           { s.l.assert(cond) }
 func (s *scanner) syntaxError(message string) { s.scanError(message, s.t) }
 func (s *scanner) errorExpected(t rune)       { s.syntaxError(s.tokenToString(t) + " expected") }
 func (s *scanner) numberError()               { s.scanError("malformed number", tkNumber) }
-func isNewLine(c rune) bool                   { return c == '\n' || c == '\r' }
-func isDecimal(c rune) bool                   { return '0' <= c && c <= '9' }
+func isNewLine(c rune) bool { return c == '\n' || c == '\r' }
+func isDecimal(c rune) bool { return '0' <= c && c <= '9' }
+func isAlpha(c rune) bool   { return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') }
 
 func (s *scanner) tokenToString(t rune) string {
 	switch {
-	case t == tkName || t == tkString:
-		return s.s
-	case t == tkNumber:
-		return fmt.Sprintf("%f", s.n)
-	case t == tkInteger:
-		return fmt.Sprintf("%d", s.i)
 	case t < firstReserved:
-		return string(t) // TODO check for printable rune
+		if t >= ' ' && t <= '~' { // printable ASCII character
+			return fmt.Sprintf("'%c'", t)
+		}
+		return fmt.Sprintf("'<\\%d>'", t)
 	case t < tkEOS:
 		return fmt.Sprintf("'%s'", tokens[t-firstReserved])
 	}
 	return tokens[t-firstReserved]
 }
 
+func (s *scanner) txtToken(token rune) string {
+	switch token {
+	case tkName, tkString, tkNumber, tkInteger:
+		// During scanning, the buffer may contain partial token text (e.g. escape errors).
+		// After scanning, tokenBuf holds the raw text from the completed token.
+		if s.buffer.Len() > 0 {
+			return fmt.Sprintf("'%s'", s.buffer.String())
+		}
+		if s.tokenBuf != "" {
+			return fmt.Sprintf("'%s'", s.tokenBuf)
+		}
+		return fmt.Sprintf("'%s'", s.s)
+	default:
+		return s.tokenToString(token)
+	}
+}
+
 func (s *scanner) scanError(message string, token rune) {
 	buff := chunkID(s.source)
 	if token != 0 {
-		message = fmt.Sprintf("%s:%d: %s near %s", buff, s.lineNumber, message, s.tokenToString(token))
+		message = fmt.Sprintf("%s:%d: %s near %s", buff, s.lineNumber, message, s.txtToken(token))
 	} else {
 		message = fmt.Sprintf("%s:%d: %s", buff, s.lineNumber, message)
 	}
@@ -173,7 +190,7 @@ func (s *scanner) skipSeparator() int { // TODO is this the right name?
 	return -i - 1
 }
 
-func (s *scanner) readMultiLine(comment bool, sep int) (str string) {
+func (s *scanner) readMultiLine(comment bool, sep int) (str string, raw string) {
 	if s.saveAndAdvance(); isNewLine(s.current) {
 		s.incrementLineNumber()
 	}
@@ -189,17 +206,14 @@ func (s *scanner) readMultiLine(comment bool, sep int) (str string) {
 			if s.skipSeparator() == sep {
 				s.saveAndAdvance()
 				if !comment {
-					str = s.buffer.String()
-					str = str[2+sep : len(str)-(2+sep)]
+					raw = s.buffer.String()
+					str = raw[2+sep : len(raw)-(2+sep)]
 				}
 				s.buffer.Reset()
 				return
 			}
-		case '\r':
-			s.current = '\n'
-			fallthrough
-		case '\n':
-			s.save(s.current)
+		case '\r', '\n':
+			s.save('\n')
 			s.incrementLineNumber()
 		default:
 			if !comment {
@@ -421,7 +435,7 @@ func (s *scanner) readNumber() token {
 	// Lua 5.3: try to parse as integer if no decimal point or exponent
 	if !isFloat {
 		if intVal, err := strconv.ParseInt(str, base10, bits64); err == nil {
-			return token{t: tkInteger, i: intVal}
+			return token{t: tkInteger, i: intVal, raw: str}
 		}
 		// Too large for int64, fall through to float
 	}
@@ -429,7 +443,7 @@ func (s *scanner) readNumber() token {
 	if err != nil {
 		s.numberError()
 	}
-	return token{t: tkNumber, n: f}
+	return token{t: tkNumber, n: f, raw: str}
 }
 
 var escapes map[rune]rune = map[rune]rune{
@@ -437,7 +451,6 @@ var escapes map[rune]rune = map[rune]rune{
 }
 
 func (s *scanner) escapeError(c []rune, message string) {
-	s.buffer.Reset()
 	s.save('\\')
 	for _, r := range c {
 		if r == endOfStream {
@@ -467,13 +480,15 @@ func (s *scanner) readHexEscape() (r rune) {
 }
 
 func (s *scanner) readDecimalEscape() (r rune) {
-	b := [3]rune{}
-	for c, i := s.current, 0; i < len(b) && isDecimal(c); i, c = i+1, s.current {
+	b := [4]rune{}
+	i := 0
+	for c := s.current; i < 3 && isDecimal(c); i, c = i+1, s.current {
 		b[i], r = c, 10*r+c-'0'
 		s.advance()
 	}
 	if r > math.MaxUint8 {
-		s.escapeError(b[:], "decimal escape too large")
+		b[i] = s.current
+		s.escapeError(b[:i+1], "decimal escape too large")
 	}
 	return
 }
@@ -488,6 +503,7 @@ func (s *scanner) readUnicodeEscape() string {
 	s.advance() // skip '{'
 
 	var codepoint rune
+	var digits []rune // track digits for error messages
 	digitCount := 0
 	for {
 		c := s.current
@@ -503,12 +519,16 @@ func (s *scanner) readUnicodeEscape() string {
 		case 'A' <= c && c <= 'F':
 			digit = c - 'A' + 10
 		default:
-			s.escapeError([]rune{'u', '{'}, "hexadecimal digit expected")
+			seq := append([]rune{'u', '{'}, digits...)
+			seq = append(seq, c)
+			s.escapeError(seq, "hexadecimal digit expected")
 		}
+		digits = append(digits, c)
 		codepoint = codepoint*16 + digit
 		digitCount++
 		if codepoint > 0x10FFFF {
-			s.escapeError([]rune{'u', '{'}, "UTF-8 value too large")
+			seq := append([]rune{'u', '{'}, digits...)
+			s.escapeError(seq, "UTF-8 value too large")
 		}
 		s.advance()
 	}
@@ -595,7 +615,7 @@ func (s *scanner) readString() token {
 	s.saveAndAdvance()
 	str := s.buffer.String()
 	s.buffer.Reset()
-	return token{t: tkString, s: str[1 : len(str)-1]}
+	return token{t: tkString, s: str[1 : len(str)-1], raw: str}
 }
 
 func isReserved(s string) bool {
@@ -612,10 +632,10 @@ func (s *scanner) reservedOrName() token {
 	s.buffer.Reset()
 	for i, reserved := range tokens[:reservedCount] {
 		if str == reserved {
-			return token{t: rune(i + firstReserved), s: reserved}
+			return token{t: rune(i + firstReserved), s: reserved, raw: str}
 		}
 	}
-	return token{t: tkName, s: str}
+	return token{t: tkName, s: str, raw: str}
 }
 
 func (s *scanner) scan() token {
@@ -638,7 +658,7 @@ func (s *scanner) scan() token {
 			}
 			if s.advance(); s.current == '[' {
 				if sep := s.skipSeparator(); sep >= 0 {
-					_ = s.readMultiLine(comment, sep)
+					_, _ = s.readMultiLine(comment, sep)
 					break
 				}
 				s.buffer.Reset()
@@ -648,7 +668,8 @@ func (s *scanner) scan() token {
 			}
 		case '[':
 			if sep := s.skipSeparator(); sep >= 0 {
-				return token{t: tkString, s: s.readMultiLine(str, sep)}
+				content, rawStr := s.readMultiLine(str, sep)
+				return token{t: tkString, s: content, raw: rawStr}
 			} else if s.buffer.Reset(); sep == -1 {
 				return token{t: '['}
 			}
@@ -703,7 +724,7 @@ func (s *scanner) scan() token {
 				}
 				s.buffer.Reset()
 				return token{t: tkConcat}
-			} else if !unicode.IsDigit(s.current) {
+			} else if !isDecimal(s.current) {
 				s.buffer.Reset()
 				return token{t: '.'}
 			} else {
@@ -712,10 +733,10 @@ func (s *scanner) scan() token {
 		case 0:
 			s.advance()
 		default:
-			if unicode.IsDigit(c) {
+			if isDecimal(c) {
 				return s.readNumber()
-			} else if c == '_' || unicode.IsLetter(c) {
-				for ; c == '_' || unicode.IsLetter(c) || unicode.IsDigit(c); c = s.current {
+			} else if c == '_' || isAlpha(c) {
+				for ; c == '_' || isAlpha(c) || isDecimal(c); c = s.current {
 					s.saveAndAdvance()
 				}
 				return s.reservedOrName()
@@ -734,6 +755,7 @@ func (s *scanner) next() {
 	} else {
 		s.token = s.scan()
 	}
+	s.tokenBuf = s.token.raw
 }
 
 func (s *scanner) lookAhead() rune {

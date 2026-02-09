@@ -32,10 +32,17 @@ var (
 	errVersionMismatch     = errors.New("lua: version mismatch in precompiled chunk")
 	errIncompatible        = errors.New("lua: incompatible precompiled chunk")
 	errCorrupted           = errors.New("lua: corrupted precompiled chunk")
+	errTruncated           = errors.New("truncated")
 )
 
 func (state *loadState) read(data interface{}) error {
-	return binary.Read(state.in, state.order, data)
+	if err := binary.Read(state.in, state.order, data); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return errTruncated
+		}
+		return err
+	}
+	return nil
 }
 
 func (state *loadState) readNumber() (f float64, err error) {

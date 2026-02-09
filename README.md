@@ -1,18 +1,15 @@
 # go-lua
 
-A Lua 5.3 VM in pure Go
+A Lua 5.3 VM in pure Go — no CGo, no dependencies.
 
-> **Note:** This is a fork of [Shopify/go-lua](https://github.com/Shopify/go-lua) with Lua 5.3 support.
+This is a fork of [Shopify/go-lua](https://github.com/Shopify/go-lua), upgraded from Lua 5.2 to **Lua 5.3**.
 
-## Overview
+## What's new compared to Shopify/go-lua?
 
-go-lua is a port of the Lua VM to pure Go. It is compatible with binary files dumped by `luac` from the [Lua reference implementation](http://www.lua.org/).
-
-This fork upgrades the original Lua 5.2 implementation to **Lua 5.3**, adding:
-
-- Native 64-bit integers (`int64`) separate from floats (`float64`)
+- Native 64-bit integers (`int64`) alongside floats (`float64`)
 - Bitwise operators: `&`, `|`, `~`, `<<`, `>>` and unary `~`
-- Integer division operator: `//`
+- Integer division: `//`
+- Coroutines: `coroutine.create`, `resume`, `yield`, `wrap`, `status`, `running`
 - UTF-8 library: `utf8.char`, `utf8.codes`, `utf8.codepoint`, `utf8.len`, `utf8.offset`
 - String packing: `string.pack`, `string.unpack`, `string.packsize`
 - Math extensions: `math.tointeger`, `math.type`, `math.ult`, `math.maxinteger`, `math.mininteger`
@@ -20,15 +17,13 @@ This fork upgrades the original Lua 5.2 implementation to **Lua 5.3**, adding:
 - Table metamethods: `table.insert`, `table.remove`, `table.sort` respect `__index`/`__newindex`
 - Hex float format: `string.format` supports `%a`/`%A`
 
-## Installation
+## Getting started
 
 ```sh
 go get github.com/speedata/go-lua
 ```
 
-## Usage
-
-go-lua is intended to be used as a Go package. A simple example:
+A minimal example:
 
 ```go
 package main
@@ -50,19 +45,17 @@ func main() {
 l := lua.NewState()
 lua.OpenLibraries(l)
 
-// Load and execute a Lua script
 lua.DoString(l, `
     function greet(name)
         return "Hello, " .. name .. "!"
     end
 `)
 
-// Call the Lua function
 l.Global("greet")
 l.PushString("World")
 l.Call(1, 1)
 result, _ := l.ToString(-1)
-fmt.Println(result) // Output: Hello, World!
+fmt.Println(result) // Hello, World!
 ```
 
 ### Registering Go functions in Lua
@@ -71,7 +64,6 @@ fmt.Println(result) // Output: Hello, World!
 l := lua.NewState()
 lua.OpenLibraries(l)
 
-// Register a Go function
 l.Register("add", func(l *lua.State) int {
     a := lua.CheckNumber(l, 1)
     b := lua.CheckNumber(l, 2)
@@ -79,79 +71,59 @@ l.Register("add", func(l *lua.State) int {
     return 1
 })
 
-lua.DoString(l, `print(add(2, 3))`) // Output: 5
+lua.DoString(l, `print(add(2, 3))`) // 5
 ```
 
-## Status
+## Test suite status
 
-### Lua 5.3 Compatibility
+We run the official Lua 5.3 test suites. Currently **19 out of 24** pass:
 
-This implementation passes **15 of the Lua 5.3 test suites**:
+| Test | Status | Notes |
+|------|--------|-------|
+| bitwise | Pass | |
+| calls | Pass | |
+| closure | Pass | |
+| code | Pass | |
+| constructs | Pass | |
+| coroutine | Pass | |
+| errors | Pass | |
+| events | Pass | |
+| files | Pass | |
+| goto | Pass | |
+| literals | Pass | |
+| locals | Pass | |
+| math | Pass | |
+| pm (pattern matching) | Pass | |
+| sort | Pass | |
+| strings | Pass | |
+| tpack (string.pack) | Pass | |
+| utf8 | Pass | |
+| vararg | Pass | |
+| attrib | — | Needs `debug.getinfo`, weak refs |
+| db | — | Needs `debug.getlocal` for coroutines |
+| gc | — | Go's GC, not controllable like Lua's |
+| big | — | Tables with >2^18 elements |
+| main | — | Requires standalone Lua binary |
 
-| Test | Status |
-|------|--------|
-| bitwise | ✅ Pass |
-| closure | ✅ Pass |
-| code | ✅ Pass |
-| constructs | ✅ Pass |
-| events | ✅ Pass |
-| files | ✅ Pass |
-| goto | ✅ Pass |
-| locals | ✅ Pass |
-| math | ✅ Pass |
-| pm (pattern matching) | ✅ Pass |
-| sort | ✅ Pass |
-| strings | ✅ Pass |
-| tpack (string.pack) | ✅ Pass |
-| utf8 | ✅ Pass |
-| vararg | ✅ Pass |
+## Known limitations
 
-### Known Limitations
-
-- **No coroutines**: `coroutine.*` functions are not implemented.
-- **No weak references**: Lua's weak tables (`__mode`) are not implemented.
-- **No `string.dump`**: Serializing functions to bytecode is not supported.
-- **No C libraries**: C Lua libraries are incompatible with this pure Go implementation.
-
-### What Works Well
-
-- All arithmetic and bitwise operations with proper integer/float semantics
-- Tables, metatables, and metamethods
-- Closures and upvalues
-- Pattern matching (`string.find`, `string.match`, `string.gmatch`, `string.gsub`)
-- All standard libraries except coroutines
-- Loading precompiled bytecode (`.luac` files)
-- Debug hooks (with slight performance cost)
+- **No weak references** — `__mode` on metatables is not supported (Go's GC doesn't offer that hook)
+- **No `string.dump`** — serializing functions to bytecode is not implemented
+- **Partial `debug` library** — `debug.getlocal` and `debug.upvalueid` are not yet implemented
+- **No C API** — pure Go, so C Lua libraries won't work (that's kind of the point though)
 
 ## Development
 
 ```sh
-# Clone
 git clone https://github.com/speedata/go-lua.git
-
-# Build
-go build
-
-# Run tests
-go test -v ./...
-
-# Some tests (undump, dump, parser) optionally use luac 5.3.
-# If luac is not in PATH, those tests are skipped automatically.
+go build ./...
+go test ./...
 ```
 
-## Performance
-
-go-lua prioritizes correctness and compatibility over raw performance. It includes debug hooks which add overhead but enable powerful debugging capabilities.
-
-Compared to C Lua 5.3:
-- Recursive function calls: ~6x slower
-- Tail calls: ~6x slower
-- Tight loops: ~10x slower
-
-This is typical for pure Go Lua implementations and sufficient for configuration, scripting, and workflow automation use cases.
+Some tests optionally use `luac` 5.3 for compiling Lua source to bytecode. If it's not in your PATH, those tests get skipped automatically.
 
 ## License
 
-go-lua is licensed under the [MIT License](LICENSE.md).
+MIT — see [LICENSE.md](LICENSE.md).
 
-This is a fork of [Shopify/go-lua](https://github.com/Shopify/go-lua). Original work Copyright (c) Shopify Inc.
+Originally forked from [Shopify/go-lua](https://github.com/Shopify/go-lua).

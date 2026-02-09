@@ -305,7 +305,7 @@ func (l *State) preCall(function int, resultCount int) bool {
 			case closure:
 			case *goFunction:
 			default:
-				l.typeError(f, "call")
+				l.typeErrorAt(function, "call")
 			}
 			// Slide the args + function up 1 slot and poke in the tag method
 			for p := l.top; p > function; p-- {
@@ -411,6 +411,10 @@ func (l *State) protect(f func()) (err error) {
 	nestedGoCallCount, protectFunction := l.nestedGoCallCount, l.protectFunction
 	l.protectFunction = func() {
 		if e := recover(); e != nil {
+			// Let yield errors propagate through to Resume's recover
+			if e == yieldError {
+				panic(e)
+			}
 			if errVal, ok := e.(error); ok {
 				err = errVal
 			} else {
@@ -464,8 +468,16 @@ func (l *State) checkStack(n int) {
 
 func (l *State) reallocStack(newSize int) {
 	l.assert(newSize <= maxStack || newSize == errorStackSize)
-	l.assert(l.stackLast == len(l.stack)-extraStack)
-	l.stack = append(l.stack, make([]value, newSize-len(l.stack))...)
+	oldSize := len(l.stack)
+	if newSize > oldSize {
+		l.stack = append(l.stack, make([]value, newSize-oldSize)...)
+	} else if newSize < oldSize {
+		// Clear references in the truncated portion to allow GC
+		for i := newSize; i < oldSize; i++ {
+			l.stack[i] = nil
+		}
+		l.stack = l.stack[:newSize]
+	}
 	l.stackLast = len(l.stack) - extraStack
 	l.callInfo.next = nil
 	for ci := l.callInfo; ci != nil; ci = ci.previous {
@@ -473,6 +485,30 @@ func (l *State) reallocStack(newSize int) {
 			top := ci.top
 			ci.frame = l.stack[top-len(ci.frame) : top]
 		}
+	}
+}
+
+func (l *State) stackInUse() int {
+	maxTop := l.top
+	for ci := l.callInfo; ci != nil; ci = ci.previous {
+		if ci.top > maxTop {
+			maxTop = ci.top
+		}
+	}
+	return maxTop + 1 + extraStack
+}
+
+func (l *State) shrinkStack() {
+	inUse := l.stackInUse()
+	goodSize := inUse + inUse/8 + 2*extraStack
+	if goodSize > maxStack {
+		goodSize = maxStack
+	}
+	if len(l.stack) > maxStack { // was handling stack overflow?
+		l.callInfo.next = nil // free extra callInfo chain
+	}
+	if inUse <= maxStack-extraStack && goodSize < len(l.stack) {
+		l.reallocStack(goodSize)
 	}
 }
 
