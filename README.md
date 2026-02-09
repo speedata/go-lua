@@ -86,7 +86,7 @@ lua.DoString(l, `print(add(2, 3))`) // Output: 5
 
 ### Lua 5.3 Compatibility
 
-This implementation passes **14 of the Lua 5.3 test suites**:
+This implementation passes **15 of the Lua 5.3 test suites**:
 
 | Test | Status |
 |------|--------|
@@ -95,6 +95,7 @@ This implementation passes **14 of the Lua 5.3 test suites**:
 | code | ✅ Pass |
 | constructs | ✅ Pass |
 | events | ✅ Pass |
+| files | ✅ Pass |
 | goto | ✅ Pass |
 | locals | ✅ Pass |
 | math | ✅ Pass |
