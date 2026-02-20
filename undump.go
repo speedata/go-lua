@@ -3,9 +3,7 @@ package lua
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
-	"math"
 	"unsafe"
 )
 
@@ -14,16 +12,15 @@ type loadState struct {
 	order binary.ByteOrder
 }
 
-// Lua 5.3 header format
-var header struct {
-	Signature               [4]byte
-	Version, Format         byte
-	Data                    [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
-	IntSize, PointerSize    byte
-	InstructionSize         byte
-	IntegerSize, NumberSize byte
-	TestInt                 int64   // LUAC_INT: 0x5678
-	TestNum                 float64 // LUAC_NUM: 370.5
+// Lua 5.4 header: no IntSize/PointerSize fields
+var header54 struct {
+	Signature                   [4]byte
+	Version, Format             byte
+	Data                        [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
+	InstructionSize             byte
+	IntegerSize, NumberSize     byte
+	TestInt                     int64   // LUAC_INT: 0x5678
+	TestNum                     float64 // LUAC_NUM: 370.5
 }
 
 var (
@@ -33,6 +30,7 @@ var (
 	errIncompatible        = errors.New("lua: incompatible precompiled chunk")
 	errCorrupted           = errors.New("lua: corrupted precompiled chunk")
 	errTruncated           = errors.New("truncated")
+	errIntegerOverflow     = errors.New("lua: integer overflow in precompiled chunk")
 )
 
 func (state *loadState) read(data interface{}) error {
@@ -55,59 +53,47 @@ func (state *loadState) readInteger() (i int64, err error) {
 	return
 }
 
-func (state *loadState) readInt() (i int32, err error) {
-	err = state.read(&i)
-	return
-}
-
-func (state *loadState) readPC() (pc, error) {
-	i, err := state.readInt()
-	return pc(i), err
-}
-
 func (state *loadState) readByte() (b byte, err error) {
 	err = state.read(&b)
 	return
 }
 
-func (state *loadState) readBool() (bool, error) {
-	b, err := state.readByte()
-	return b != 0, err
+// readUnsigned reads a variable-length unsigned integer (Lua 5.4 format).
+// Each byte contributes 7 bits; MSB (0x80) set means this is the last byte.
+func (state *loadState) readUnsigned(limit uint64) (uint64, error) {
+	var x uint64
+	limit >>= 7
+	for {
+		b, err := state.readByte()
+		if err != nil {
+			return 0, err
+		}
+		if x >= limit {
+			return 0, errIntegerOverflow
+		}
+		x = (x << 7) | uint64(b&0x7f)
+		if b&0x80 != 0 {
+			return x, nil
+		}
+	}
+}
+
+func (state *loadState) readSize() (int, error) {
+	n, err := state.readUnsigned(^uint64(0))
+	return int(n), err
+}
+
+func (state *loadState) readInt() (int, error) {
+	n, err := state.readUnsigned(uint64(maxInt))
+	return int(n), err
 }
 
 func (state *loadState) readString() (s string, err error) {
-	// Lua 5.3: 1-byte prefix for short strings, 0xFF + size_t for long strings
-	var sizeByte byte
-	if sizeByte, err = state.readByte(); err != nil || sizeByte == 0 {
+	size, err := state.readSize()
+	if err != nil || size == 0 {
 		return
 	}
-
-	var size uint64
-	if sizeByte == 0xFF {
-		// Long string: read full size_t
-		maxUint := ^uint(0)
-		if uint64(maxUint) == math.MaxUint64 {
-			var size64 uint64
-			if err = state.read(&size64); err != nil {
-				return
-			}
-			size = size64
-		} else {
-			var size32 uint32
-			if err = state.read(&size32); err != nil {
-				return
-			}
-			size = uint64(size32)
-		}
-	} else {
-		// Short string: size is in the byte (1-254)
-		size = uint64(sizeByte)
-	}
-
-	// Size includes the terminating NUL, but Lua 5.3 doesn't write NUL
-	if size == 0 {
-		return
-	}
+	// size includes conceptual NUL; actual data is size-1 bytes
 	ba := make([]byte, size-1)
 	if err = state.read(ba); err == nil {
 		s = string(ba)
@@ -130,20 +116,28 @@ func (state *loadState) readUpValues() (u []upValueDesc, err error) {
 	if err != nil || n == 0 {
 		return
 	}
-	v := make([]struct{ IsLocal, Index byte }, n)
-	err = state.read(v)
-	if err != nil {
-		return
-	}
+	// Lua 5.4: 3 bytes per upvalue (instack, idx, kind)
 	u = make([]upValueDesc, n)
-	for i := range v {
-		u[i].isLocal, u[i].index = v[i].IsLocal != 0, int(v[i].Index)
+	for i := range u {
+		var instack, idx, kind byte
+		if instack, err = state.readByte(); err != nil {
+			return
+		}
+		if idx, err = state.readByte(); err != nil {
+			return
+		}
+		if kind, err = state.readByte(); err != nil {
+			return
+		}
+		u[i].isLocal = instack != 0
+		u[i].index = int(idx)
+		u[i].kind = kind
 	}
 	return
 }
 
 func (state *loadState) readLocalVariables() (localVariables []localVariable, err error) {
-	var n int32
+	var n int
 	if n, err = state.readInt(); err != nil || n == 0 {
 		return
 	}
@@ -152,83 +146,90 @@ func (state *loadState) readLocalVariables() (localVariables []localVariable, er
 		if localVariables[i].name, err = state.readString(); err != nil {
 			return
 		}
-		if localVariables[i].startPC, err = state.readPC(); err != nil {
+		startPC, e := state.readInt()
+		if e != nil {
+			err = e
 			return
 		}
-		if localVariables[i].endPC, err = state.readPC(); err != nil {
+		localVariables[i].startPC = pc(startPC)
+		endPC, e := state.readInt()
+		if e != nil {
+			err = e
 			return
 		}
-	}
-	return
-}
-
-func (state *loadState) readLineInfo() (lineInfo []int32, err error) {
-	var n int32
-	if n, err = state.readInt(); err != nil || n == 0 {
-		return
-	}
-	lineInfo = make([]int32, n)
-	err = state.read(lineInfo)
-	return
-}
-
-func (state *loadState) readDebug(p *prototype) (source string, lineInfo []int32, localVariables []localVariable, names []string, err error) {
-	var n int32
-	if source, err = state.readString(); err != nil {
-		return
-	}
-	if lineInfo, err = state.readLineInfo(); err != nil {
-		return
-	}
-	if localVariables, err = state.readLocalVariables(); err != nil {
-		return
-	}
-	if n, err = state.readInt(); err != nil {
-		return
-	}
-	names = make([]string, n)
-	for i := range names {
-		if names[i], err = state.readString(); err != nil {
+		localVariables[i].endPC = pc(endPC)
+		// Lua 5.4: read variable kind byte
+		if localVariables[i].kind, err = state.readByte(); err != nil {
 			return
 		}
 	}
 	return
 }
 
-// readDebug53 reads Lua 5.3 debug info (source is read earlier in function)
-func (state *loadState) readDebug53(p *prototype) (lineInfo []int32, localVariables []localVariable, err error) {
-	var n int32
-	if lineInfo, err = state.readLineInfo(); err != nil {
-		return
+// readDebug54 reads Lua 5.4 debug info (split lineinfo)
+func (state *loadState) readDebug54(p *prototype) error {
+	// Relative line info (int8 per instruction)
+	n, err := state.readInt()
+	if err != nil {
+		return err
 	}
-	if localVariables, err = state.readLocalVariables(); err != nil {
-		return
+	if n > 0 {
+		p.lineInfo = make([]int8, n)
+		if err = state.read(p.lineInfo); err != nil {
+			return err
+		}
 	}
-	// Read upvalue names
-	if n, err = state.readInt(); err != nil {
-		return
+
+	// Absolute line info
+	n, err = state.readInt()
+	if err != nil {
+		return err
 	}
-	for i := 0; i < int(n) && i < len(p.upValues); i++ {
+	if n > 0 {
+		p.absLineInfos = make([]absLineInfo, n)
+		for i := range p.absLineInfos {
+			if p.absLineInfos[i].pc, err = state.readInt(); err != nil {
+				return err
+			}
+			if p.absLineInfos[i].line, err = state.readInt(); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Local variables
+	p.localVariables, err = state.readLocalVariables()
+	if err != nil {
+		return err
+	}
+
+	// Upvalue names
+	n, err = state.readInt()
+	if err != nil {
+		return err
+	}
+	for i := 0; i < n && i < len(p.upValues); i++ {
 		if p.upValues[i].name, err = state.readString(); err != nil {
-			return
+			return err
 		}
 	}
-	return
+	return nil
 }
 
-// Lua 5.3 type tags for constants
+// Lua 5.4 type tags for constants
 const (
-	luaTNil     = 0x00
-	luaTBoolean = 0x01
-	luaTNumFlt  = 0x03 // LUA_TNUMFLT: float constant
-	luaTNumInt  = 0x13 // LUA_TNUMINT: integer constant (0x03 | (1 << 4))
-	luaTShrStr  = 0x04 // LUA_TSHRSTR: short string
-	luaTLngStr  = 0x14 // LUA_TLNGSTR: long string (0x04 | (1 << 4))
+	luaVNil    = 0x00 // LUA_VNIL
+	luaVFalse  = 0x01 // LUA_VFALSE = makevariant(1, 0)
+	luaVTrue   = 0x11 // LUA_VTRUE  = makevariant(1, 1)
+	luaVNumInt = 0x03 // LUA_VNUMINT = makevariant(3, 0)
+	luaVNumFlt = 0x13 // LUA_VNUMFLT = makevariant(3, 1)
+	luaVShrStr = 0x04 // LUA_VSHRSTR = makevariant(4, 0)
+	luaVLngStr = 0x14 // LUA_VLNGSTR = makevariant(4, 1)
 )
 
-func (state *loadState) readConstants() (constants []value, prototypes []prototype, err error) {
-	var n int32
-	if n, err = state.readInt(); err != nil || n == 0 {
+func (state *loadState) readConstants() (constants []value, err error) {
+	n, err := state.readInt()
+	if err != nil || n == 0 {
 		return
 	}
 
@@ -238,15 +239,17 @@ func (state *loadState) readConstants() (constants []value, prototypes []prototy
 		switch t, err = state.readByte(); {
 		case err != nil:
 			return
-		case t == luaTNil:
+		case t == luaVNil:
 			constants[i] = nil
-		case t == luaTBoolean:
-			constants[i], err = state.readBool()
-		case t == luaTNumFlt:
-			constants[i], err = state.readNumber()
-		case t == luaTNumInt:
+		case t == luaVFalse:
+			constants[i] = false
+		case t == luaVTrue:
+			constants[i] = true
+		case t == luaVNumInt:
 			constants[i], err = state.readInteger()
-		case t == luaTShrStr || t == luaTLngStr:
+		case t == luaVNumFlt:
+			constants[i], err = state.readNumber()
+		case t == luaVShrStr || t == luaVLngStr:
 			constants[i], err = state.readString()
 		default:
 			err = errUnknownConstantType
@@ -258,34 +261,52 @@ func (state *loadState) readConstants() (constants []value, prototypes []prototy
 	return
 }
 
-func (state *loadState) readPrototypes() (prototypes []prototype, err error) {
-	var n int32
-	if n, err = state.readInt(); err != nil || n == 0 {
+func (state *loadState) readPrototypes(psource string) (prototypes []prototype, err error) {
+	n, err := state.readInt()
+	if err != nil || n == 0 {
 		return
 	}
 	prototypes = make([]prototype, n)
 	for i := range prototypes {
-		if prototypes[i], err = state.readFunction(); err != nil {
+		if prototypes[i], err = state.readFunction(psource); err != nil {
 			return
 		}
 	}
 	return
 }
 
-func (state *loadState) readFunction() (p prototype, err error) {
-	// Lua 5.3 function format: source first, then rest
-	if p.source, err = state.readString(); err != nil {
+func (state *loadState) readFunction(psource string) (p prototype, err error) {
+	// Lua 5.4: source first (nullable, inherits from parent).
+	// A NULL source (size 0 in dump) means "inherit from parent" or
+	// "no source" (stripped). We read the size directly to distinguish
+	// NULL (size=0) from an explicitly empty string (size=1).
+	sourceSize, err := state.readSize()
+	if err != nil {
 		return
 	}
-	var n int32
+	if sourceSize == 0 {
+		// NULL source: inherit from parent, or "=?" if no parent
+		if psource != "" {
+			p.source = psource
+		} else {
+			p.source = "=?"
+		}
+	} else {
+		ba := make([]byte, sourceSize-1)
+		if err = state.read(ba); err != nil {
+			return
+		}
+		p.source = string(ba)
+	}
+	var n int
 	if n, err = state.readInt(); err != nil {
 		return
 	}
-	p.lineDefined = int(n)
+	p.lineDefined = n
 	if n, err = state.readInt(); err != nil {
 		return
 	}
-	p.lastLineDefined = int(n)
+	p.lastLineDefined = n
 	var b byte
 	if b, err = state.readByte(); err != nil {
 		return
@@ -302,45 +323,33 @@ func (state *loadState) readFunction() (p prototype, err error) {
 	if p.code, err = state.readCode(); err != nil {
 		return
 	}
-	// Lua 5.3: constants, upvalues, prototypes (not constants+prototypes together)
-	if p.constants, _, err = state.readConstants(); err != nil {
+	// Lua 5.4: constants, upvalues, prototypes, debug
+	if p.constants, err = state.readConstants(); err != nil {
 		return
 	}
 	if p.upValues, err = state.readUpValues(); err != nil {
 		return
 	}
-	if p.prototypes, err = state.readPrototypes(); err != nil {
+	if p.prototypes, err = state.readPrototypes(p.source); err != nil {
 		return
 	}
-	// Lua 5.3: debug info without source (source is at start)
-	if p.lineInfo, p.localVariables, err = state.readDebug53(&p); err != nil {
+	if err = state.readDebug54(&p); err != nil {
 		return
 	}
 	return
 }
 
 func init() {
-	copy(header.Signature[:], Signature)
-	header.Version = VersionMajor<<4 | VersionMinor
-	header.Format = 0
+	copy(header54.Signature[:], Signature)
+	header54.Version = VersionMajor<<4 | VersionMinor
+	header54.Format = 0
 	data := "\x19\x93\r\n\x1a\n"
-	copy(header.Data[:], data)
-	header.IntSize = 4
-	header.PointerSize = byte(1+^uintptr(0)>>32&1) * 4
-	header.InstructionSize = 4 // sizeof(Instruction) = uint32
-	header.IntegerSize = 8     // sizeof(lua_Integer) = int64
-	header.NumberSize = 8      // sizeof(lua_Number) = float64
-	header.TestInt = 0x5678
-	header.TestNum = 370.5
-
-	// The uintptr numeric type is implementation-specific
-	uintptrBitCount := byte(0)
-	for bits := ^uintptr(0); bits != 0; bits >>= 1 {
-		uintptrBitCount++
-	}
-	if uintptrBitCount != header.PointerSize*8 {
-		panic(fmt.Sprintf("invalid pointer size (%d)", uintptrBitCount))
-	}
+	copy(header54.Data[:], data)
+	header54.InstructionSize = 4 // sizeof(Instruction) = uint32
+	header54.IntegerSize = 8     // sizeof(lua_Integer) = int64
+	header54.NumberSize = 8      // sizeof(lua_Number) = float64
+	header54.TestInt = 0x5678
+	header54.TestNum = 370.5
 }
 
 func endianness() binary.ByteOrder {
@@ -351,38 +360,39 @@ func endianness() binary.ByteOrder {
 }
 
 func (state *loadState) checkHeader() error {
-	h := header
+	h := header54
 	if err := state.read(&h); err != nil {
 		return err
-	} else if h == header {
+	} else if h == header54 {
 		return nil
 	} else if string(h.Signature[:]) != Signature {
 		return errNotPrecompiledChunk
-	} else if h.Version != header.Version || h.Format != header.Format {
+	} else if h.Version != header54.Version || h.Format != header54.Format {
 		return errVersionMismatch
-	} else if h.Data != header.Data {
+	} else if h.Data != header54.Data {
 		return errCorrupted
 	}
 	return errIncompatible
 }
 
 func (l *State) undump(in io.Reader, name string) (c *luaClosure, err error) {
-	if name[0] == '@' || name[0] == '=' {
-		name = name[1:]
-	} else if name[0] == Signature[0] {
-		name = "binary string"
+	if len(name) > 0 {
+		if name[0] == '@' || name[0] == '=' {
+			name = name[1:]
+		} else if name[0] == Signature[0] {
+			name = "binary string"
+		}
 	}
-	// TODO assign name to p.source?
 	s := &loadState{in, endianness()}
 	var p prototype
 	if err = s.checkHeader(); err != nil {
 		return
 	}
-	// Lua 5.3: read upvalue count byte after header
+	// Lua 5.4: read upvalue count byte after header
 	if _, err = s.readByte(); err != nil {
 		return
 	}
-	if p, err = s.readFunction(); err != nil {
+	if p, err = s.readFunction(""); err != nil {
 		return
 	}
 	c = l.newLuaClosure(&p)

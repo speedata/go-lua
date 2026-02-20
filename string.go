@@ -563,32 +563,49 @@ func findHelper(l *State, isFind bool) int {
 	return 1
 }
 
+// scanFormat greedily scans a format specifier (like C Lua's getformat).
+// It collects flags, digits, dots, and the conversion character.
 func scanFormat(l *State, fs string) string {
+	const allFlags = "-+ #0123456789."
 	i := 0
-	skipDigit := func() {
-		if unicode.IsDigit(rune(fs[i])) {
-			i++
+	for i < len(fs) && strings.ContainsRune(allFlags, rune(fs[i])) {
+		i++
+	}
+	i++ // include the conversion specifier
+	if i > 22 { // MAX_FORMAT - 10
+		Errorf(l, "invalid format (too long)")
+	}
+	return "%" + fs[:i]
+}
+
+// checkFormat validates a format specifier per conversion type (like C Lua's checkformat).
+// flags: allowed flags for this conversion type.
+// precision: whether precision is allowed.
+func checkFormat(l *State, form string, flags string, precision bool) {
+	spec := form[1:] // skip '%'
+	// Skip allowed flags
+	j := 0
+	for j < len(spec) && strings.ContainsRune(flags, rune(spec[j])) {
+		j++
+	}
+	spec = spec[j:]
+	if len(spec) > 0 && spec[0] != '0' {
+		// Skip up to 2 digits (width)
+		for k := 0; k < 2 && len(spec) > 0 && spec[0] >= '0' && spec[0] <= '9'; k++ {
+			spec = spec[1:]
+		}
+		if len(spec) > 0 && spec[0] == '.' && precision {
+			spec = spec[1:]
+			// Skip up to 2 digits (precision)
+			for k := 0; k < 2 && len(spec) > 0 && spec[0] >= '0' && spec[0] <= '9'; k++ {
+				spec = spec[1:]
+			}
 		}
 	}
-	flags := "-+ #0"
-	for i < len(fs) && strings.ContainsRune(flags, rune(fs[i])) {
-		i++
+	// Must end at the conversion specifier (alpha character)
+	if len(spec) != 1 || !(spec[0] >= 'A' && spec[0] <= 'Z') && !(spec[0] >= 'a' && spec[0] <= 'z') {
+		Errorf(l, "invalid conversion specification: '%s'", form)
 	}
-	if i >= len(flags) {
-		Errorf(l, "invalid format (repeated flags)")
-	}
-	skipDigit()
-	skipDigit()
-	if fs[i] == '.' {
-		i++
-		skipDigit()
-		skipDigit()
-	}
-	if unicode.IsDigit(rune(fs[i])) {
-		Errorf(l, "invalid format (width or precision too long)")
-	}
-	i++
-	return "%" + fs[:i]
 }
 
 func formatHelper(l *State, fs string, argCount int) string {
@@ -605,15 +622,17 @@ func formatHelper(l *State, fs string, argCount int) string {
 			f := scanFormat(l, fs[i:])
 			switch i += len(f) - 2; fs[i] {
 			case 'c':
-				// Ensure each character is represented by a single byte, while preserving format modifiers.
+				checkFormat(l, f, "-", false)
+				// Lua's %c produces a single byte (like string.char), not UTF-8
 				c := CheckInteger(l, arg)
-				fmt.Fprintf(&b, f, 'x')
-				buf := b.Bytes()
-				buf[len(buf)-1] = byte(c)
+				charStr := string([]byte{byte(c)})
+				fmtStr := f[:len(f)-1] + "s"
+				fmt.Fprintf(&b, fmtStr, charStr)
 			case 'i': // The fmt package doesn't support %i.
 				f = f[:len(f)-1] + "d"
 				fallthrough
 			case 'd':
+				checkFormat(l, f, "-+0 ", true)
 				// Lua 5.3: handle integers directly to preserve precision
 				v := l.ToValue(arg)
 				switch val := v.(type) {
@@ -626,18 +645,22 @@ func formatHelper(l *State, fs string, argCount int) string {
 					Errorf(l, "number expected")
 				}
 			case 'u': // The fmt package doesn't support %u.
+				checkFormat(l, f, "-0", true)
 				// Lua 5.3: handle integers as unsigned
+				// Preserve format flags/precision by replacing 'u' with 'd'
+				fmtStr := f[:len(f)-1] + "d"
 				v := l.ToValue(arg)
 				switch val := v.(type) {
 				case int64:
-					fmt.Fprintf(&b, "%d", uint64(val))
+					fmt.Fprintf(&b, fmtStr, uint64(val))
 				case float64:
 					ArgumentCheck(l, math.Floor(val) == val && 0.0 <= val && val < math.Pow(2, 64), arg, "not a non-negative number in proper range")
-					fmt.Fprintf(&b, "%d", uint64(val))
+					fmt.Fprintf(&b, fmtStr, uint64(val))
 				default:
 					Errorf(l, "number expected")
 				}
 			case 'o', 'x', 'X':
+				checkFormat(l, f, "-#0", true)
 				// Lua 5.3: integers (including negative) are treated as unsigned
 				v := l.ToValue(arg)
 				switch val := v.(type) {
@@ -650,8 +673,10 @@ func formatHelper(l *State, fs string, argCount int) string {
 					Errorf(l, "number expected")
 				}
 			case 'e', 'E', 'f', 'g', 'G':
+				checkFormat(l, f, "-+ #0", true)
 				fmt.Fprintf(&b, f, CheckNumber(l, arg))
 			case 'a', 'A':
+				checkFormat(l, f, "-+ #0", true)
 				// Lua 5.3: hexadecimal floating-point format
 				// Go uses %x/%X for hex floats, Lua uses %a/%A
 				n := CheckNumber(l, arg)
@@ -684,6 +709,9 @@ func formatHelper(l *State, fs string, argCount int) string {
 				}
 				b.WriteString(s)
 			case 'q':
+				if len(f) > 2 { // has modifiers
+					Errorf(l, "specifier '%%q' cannot have modifiers")
+				}
 				// Lua 5.3: %q handles multiple types
 				switch v := l.ToValue(arg).(type) {
 				case nil:
@@ -736,20 +764,57 @@ func formatHelper(l *State, fs string, argCount int) string {
 				default:
 					Errorf(l, "no literal")
 				}
+			case 'p':
+				checkFormat(l, f, "-", false)
+				v := l.indexToValue(l.AbsIndex(arg))
+				var pstr string
+				switch val := v.(type) {
+				case string:
+					if len(val) > 0 {
+						pstr = fmt.Sprintf("%p", unsafe.StringData(val))
+					}
+				case *table:
+					pstr = fmt.Sprintf("%p", val)
+				case *luaClosure:
+					pstr = fmt.Sprintf("%p", val)
+				case *goClosure:
+					pstr = fmt.Sprintf("%p", val)
+				case *goFunction:
+					pstr = fmt.Sprintf("%p", val)
+				case *userData:
+					pstr = fmt.Sprintf("%p", val)
+				case *State:
+					pstr = fmt.Sprintf("%p", val)
+				}
+				if pstr == "" {
+					pstr = "(null)"
+				}
+				// Apply width/alignment from format string
+				if len(f) > 2 {
+					// Replace %p with %s in format and use the pointer string
+					fmtStr := f[:len(f)-1] + "s"
+					fmt.Fprintf(&b, fmtStr, pstr)
+				} else {
+					b.WriteString(pstr)
+				}
 			case 's':
 				s, _ := ToStringMeta(l, arg)
-				// Lua 5.3: %s with width/precision must error if string contains zeros
-				hasWidthOrPrecision := len(f) > 2 // more than just "%s"
-				if hasWidthOrPrecision && strings.ContainsRune(s, 0) {
-					Errorf(l, "string contains zeros")
-				}
-				if !strings.ContainsRune(f, '.') && len(s) >= 100 {
+				if len(f) == 2 { // no modifiers, just "%s"
 					b.WriteString(s)
 				} else {
-					fmt.Fprintf(&b, f, s)
+					checkFormat(l, f, "-", true)
+					// Lua 5.3: %s with width/precision must error if string contains zeros
+					if strings.ContainsRune(s, 0) {
+						ArgumentCheck(l, false, arg, "string contains zeros")
+					}
+					if !strings.ContainsRune(f, '.') && len(s) >= 100 {
+						b.WriteString(s)
+					} else {
+						fmt.Fprintf(&b, f, s)
+					}
 				}
 			default:
-				Errorf(l, fmt.Sprintf("invalid option '%%%c' to 'format'", fs[i]))
+				Errorf(l, "invalid conversion '%s' to 'format'", f)
 			}
 		}
 	}
@@ -1667,19 +1732,26 @@ func gmatchAux(l *State) int {
 	return 1
 }
 
-// string.gmatch(s, pattern)
+// string.gmatch(s, pattern, init)
 func stringGmatch(l *State) int {
-	CheckString(l, 1)
+	s := CheckString(l, 1)
 	CheckString(l, 2)
+	init := relativePosition(OptInteger(l, 3, 1), len(s))
+	if init < 1 {
+		init = 1
+	}
 	l.SetTop(2)
-	l.PushInteger(0)  // Initial position (0-based)
-	l.PushInteger(-1) // lastMatch - initialized to -1 (Lua 5.3.3)
+	l.PushInteger(init - 1) // Convert 1-based init to 0-based position
+	l.PushInteger(-1)       // lastMatch - initialized to -1 (Lua 5.3.3)
 	l.PushGoClosure(gmatchAux, 4)
 	return 1
 }
 
 // addReplace handles replacement for gsub
-func addReplace(l *State, ms *matchState, b *bytes.Buffer, sstart, send int) {
+// addReplace adds the replacement value to the buffer.
+// Returns true if the original string was changed. (Function calls and
+// table indexing resulting in nil or false do not change the subject.)
+func addReplace(l *State, ms *matchState, b *bytes.Buffer, sstart, send int) bool {
 	switch l.TypeOf(3) {
 	case TypeString, TypeNumber:
 		repl, _ := l.ToString(3)
@@ -1708,38 +1780,45 @@ func addReplace(l *State, ms *matchState, b *bytes.Buffer, sstart, send int) {
 				}
 			}
 		}
+		return true // string/number replacement always changes
 	case TypeFunction:
 		l.PushValue(3)
 		n := ms.pushCaptures(sstart, send)
 		l.Call(n, 1)
-		if !l.IsNil(-1) {
+		if l.ToBoolean(-1) {
+			// not nil and not false
 			if s, ok := l.ToString(-1); ok {
 				b.WriteString(s)
 			} else {
 				Errorf(l, "invalid replacement value (a %s)", l.TypeOf(-1).String())
 			}
-		} else {
-			// nil or false means no replacement, use original
-			b.WriteString(ms.src[sstart:send])
+			l.Pop(1)
+			return true // something changed
 		}
+		// nil or false means no replacement, use original
 		l.Pop(1)
+		b.WriteString(ms.src[sstart:send])
+		return false // no change
 	case TypeTable:
 		ms.pushOneCapture(0, sstart, send)
 		l.Table(3)
-		if !l.IsNil(-1) && l.ToBoolean(-1) {
-			// Not nil and not false
+		if l.ToBoolean(-1) {
+			// not nil and not false
 			if s, ok := l.ToString(-1); ok {
 				b.WriteString(s)
 			} else {
 				Errorf(l, "invalid replacement value (a %s)", l.TypeOf(-1).String())
 			}
-		} else {
-			// nil or false means no replacement, use original
-			b.WriteString(ms.src[sstart:send])
+			l.Pop(1)
+			return true // something changed
 		}
+		// nil or false means no replacement, use original
 		l.Pop(1)
+		b.WriteString(ms.src[sstart:send])
+		return false // no change
 	default:
 		ArgumentError(l, 3, "string/function/table expected")
+		return false
 	}
 }
 
@@ -1765,6 +1844,7 @@ func stringGsub(l *State) int {
 
 	var b bytes.Buffer
 	n := 0
+	changed := false
 	spos := 0
 	lastMatch := -1 // Track where last successful substitution ended (Lua 5.3.3)
 
@@ -1777,9 +1857,10 @@ func stringGsub(l *State) int {
 		// Lua 5.3.3: reject match if it ends at same position as last match
 		// This prevents double-substitution at the same position
 		if ok && end != lastMatch {
-			// Add replacement
-			addReplace(l, ms, &b, spos, end)
 			n++
+			if addReplace(l, ms, &b, spos, end) {
+				changed = true
+			}
 			spos = end
 			lastMatch = end
 		} else if spos < len(s) {
@@ -1795,12 +1876,15 @@ func stringGsub(l *State) int {
 		}
 	}
 
-	// Add remainder
-	if spos <= len(s) {
-		b.WriteString(s[spos:])
+	if !changed {
+		l.PushString(s) // no changes: return original string
+	} else {
+		// Add remainder and push new string
+		if spos <= len(s) {
+			b.WriteString(s[spos:])
+		}
+		l.PushString(b.String())
 	}
-
-	l.PushString(b.String())
 	l.PushInteger(n)
 	return 2
 }
@@ -1841,9 +1925,10 @@ var stringLibrary = []RegistryFunction{
 	}},
 	{"dump", func(l *State) int {
 		CheckType(l, 1, TypeFunction)
+		strip := l.ToBoolean(2)
 		l.SetTop(1)
 		var buf bytes.Buffer
-		if err := l.Dump(&buf); err != nil {
+		if err := l.Dump(&buf, strip); err != nil {
 			Errorf(l, "%s", err.Error())
 		}
 		l.PushString(buf.String())

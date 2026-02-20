@@ -97,8 +97,9 @@ func (p *parser) constructor() exprDesc {
 	return t
 }
 
-func (p *parser) functionArguments(f exprDesc, line int) exprDesc {
+func (p *parser) functionArguments(f exprDesc) exprDesc {
 	var args exprDesc
+	line := p.lineNumber // capture line where args start (the '(' line)
 	switch p.t {
 	case '(':
 		p.next()
@@ -147,7 +148,6 @@ func (p *parser) primaryExpression() (e exprDesc) {
 }
 
 func (p *parser) suffixedExpression() exprDesc {
-	line := p.lineNumber
 	e := p.primaryExpression()
 	for {
 		switch p.t {
@@ -157,9 +157,9 @@ func (p *parser) suffixedExpression() exprDesc {
 			e = p.function.Indexed(p.function.ExpressionToAnyRegisterOrUpValue(e), p.index())
 		case ':':
 			p.next()
-			e = p.functionArguments(p.function.Self(e, p.checkNameAsExpression()), line)
+			e = p.functionArguments(p.function.Self(e, p.checkNameAsExpression()))
 		case '(', tkString, '{':
-			e = p.functionArguments(p.function.ExpressionToNextRegister(e), line)
+			e = p.functionArguments(p.function.ExpressionToNextRegister(e))
 		default:
 			return e
 		}
@@ -343,6 +343,7 @@ func (p *parser) index() exprDesc {
 }
 
 func (p *parser) assignment(t *assignmentTarget, variableCount int) {
+	p.function.checkReadOnly(t.exprDesc)
 	if p.checkCondition(t.isVariable(), "syntax error"); p.testNext(',') {
 		e := p.suffixedExpression()
 		if e.kind != kindIndexed {
@@ -365,7 +366,9 @@ func (p *parser) assignment(t *assignmentTarget, variableCount int) {
 }
 
 func (p *parser) forBody(base, line, n int, isNumeric bool) {
-	p.function.AdjustLocalVariables(3)
+	if isNumeric {
+		p.function.AdjustLocalVariables(3)
+	}
 	p.checkNext(tkDo)
 	prep := p.function.OpenForBody(base, n, isNumeric)
 	p.block()
@@ -375,9 +378,9 @@ func (p *parser) forBody(base, line, n int, isNumeric bool) {
 func (p *parser) forNumeric(name string, line int) {
 	expr := func() { p.assert(p.function.ExpressionToNextRegister(p.expression()).kind == kindNonRelocatable) }
 	base := p.function.freeRegisterCount
-	p.function.MakeLocalVariable("(for index)")
-	p.function.MakeLocalVariable("(for limit)")
-	p.function.MakeLocalVariable("(for step)")
+	p.function.MakeLocalVariable("(for state)")
+	p.function.MakeLocalVariable("(for state)")
+	p.function.MakeLocalVariable("(for state)")
 	p.function.MakeLocalVariable(name)
 	p.checkNext('=')
 	expr()
@@ -394,10 +397,11 @@ func (p *parser) forNumeric(name string, line int) {
 }
 
 func (p *parser) forList(name string) {
-	n, base := 4, p.function.freeRegisterCount
-	p.function.MakeLocalVariable("(for generator)")
+	n, base := 5, p.function.freeRegisterCount
 	p.function.MakeLocalVariable("(for state)")
-	p.function.MakeLocalVariable("(for control)")
+	p.function.MakeLocalVariable("(for state)")
+	p.function.MakeLocalVariable("(for state)")
+	p.function.MakeLocalVariable("(for state)")
 	p.function.MakeLocalVariable(name)
 	for ; p.testNext(','); n++ {
 		p.function.MakeLocalVariable(p.checkName())
@@ -405,9 +409,12 @@ func (p *parser) forList(name string) {
 	p.checkNext(tkIn)
 	line := p.lineNumber
 	e, c := p.expressionList()
-	p.function.AdjustAssignment(3, c, e)
+	p.function.AdjustAssignment(4, c, e)
+	p.function.AdjustLocalVariables(4)
+	// Lua 5.4: mark the 4th control variable (to-be-closed) so OP_CLOSE is emitted at loop exit
+	p.function.markToBeClose()
 	p.function.CheckStack(3)
-	p.forBody(base, line, n-3, false)
+	p.forBody(base, line, n-4, false)
 }
 
 func (p *parser) forStatement(line int) {
@@ -430,11 +437,14 @@ func (p *parser) testThenBlock(escapes int) int {
 	p.next()
 	e := p.expression()
 	p.checkNext(tkThen)
-	if p.t == tkGoto || p.t == tkBreak {
+	if p.t == tkBreak {
+		line := p.lineNumber
 		e = p.function.GoIfFalse(e)
+		p.next() // skip 'break'
 		p.function.EnterBlock(false)
-		p.gotoStatement(e.t)
-		p.skipEmptyStatements()
+		p.function.MakeGoto("break", line, e.t)
+		for p.testNext(';') {
+		} // skip semicolons only (not labels)
 		if p.blockFollow(false) {
 			p.function.LeaveBlock()
 			return escapes
@@ -492,10 +502,16 @@ func (p *parser) repeatStatement(line int) {
 	p.statementList()
 	p.checkMatch(tkUntil, tkRepeat, line)
 	conditionExit := p.condition()
-	if p.function.block.hasUpValue {
-		p.function.PatchClose(conditionExit, p.function.block.activeVariableCount)
+	hasUpValue := p.function.block.hasUpValue
+	scopeLevel := p.function.block.activeVariableCount
+	p.function.LeaveBlock() // finish scope
+	if hasUpValue {
+		exit := p.function.Jump()
+		p.function.PatchToHere(conditionExit)
+		p.function.EncodeABC(opClose, scopeLevel, 0, 0)
+		conditionExit = p.function.Jump()
+		p.function.PatchToHere(exit)
 	}
-	p.function.LeaveBlock()                  // finish scope
 	p.function.PatchList(conditionExit, top) // close loop
 	p.function.LeaveBlock()                  // finish loop
 }
@@ -508,12 +524,25 @@ func (p *parser) condition() int {
 	return p.function.GoIfTrue(e).f
 }
 
-func (p *parser) gotoStatement(pc int) {
-	if line := p.lineNumber; p.testNext(tkGoto) {
-		p.function.MakeGoto(p.checkName(), line, pc)
+func (p *parser) gotoStatement() {
+	line := p.lineNumber
+	var name string
+	if p.testNext(tkGoto) {
+		name = p.checkName()
 	} else {
 		p.next()
-		p.function.MakeGoto("break", line, pc)
+		name = "break"
+	}
+	// Lua 5.4: for backward jumps (label already exists), emit CLOSE before JMP.
+	// This matches C Lua's gotostat which searches for the label before emitting JMP.
+	if lb := p.function.findExistingLabel(name); lb != nil {
+		if p.function.activeVariableCount > lb.activeVariableCount {
+			p.function.EncodeABC(opClose, p.function.regLevelAt(lb.activeVariableCount), 0, 0)
+		}
+		p.function.PatchList(p.function.Jump(), lb.pc)
+	} else {
+		// Forward jump: emit JMP, add pending goto for later resolution
+		p.function.MakeGoto(name, line, p.function.Jump())
 	}
 }
 
@@ -531,7 +560,10 @@ func (p *parser) labelStatement(label string, line int) {
 	if p.blockFollow(false) {
 		p.activeLabels[l].activeVariableCount = p.function.block.activeVariableCount
 	}
-	p.function.FindGotos(l)
+	if p.function.FindGotos(l) {
+		// Lua 5.4: emit CLOSE at the label position for gotos that cross TBC scopes
+		p.function.EncodeABC(opClose, p.function.regLevel(), 0, 0)
+	}
 }
 
 func (p *parser) parameterList() {
@@ -550,10 +582,12 @@ func (p *parser) parameterList() {
 			}
 		}
 	}
-	// TODO the following lines belong in a *function method
 	p.function.f.isVarArg = isVarArg
 	p.function.AdjustLocalVariables(n)
 	p.function.f.parameterCount = p.function.activeVariableCount
+	if isVarArg {
+		p.function.EncodeABC(opVarArgPrep, p.function.activeVariableCount, 0, 0)
+	}
 	p.function.ReserveRegisters(p.function.activeVariableCount)
 }
 
@@ -584,6 +618,7 @@ func (p *parser) functionName() (e exprDesc, isMethod bool) {
 func (p *parser) functionStatement(line int) {
 	p.next()
 	v, m := p.functionName()
+	p.function.checkReadOnly(v) // Lua 5.4: check for const assignment
 	p.function.StoreVariable(v, p.body(m, line))
 	p.function.FixLine(line)
 }
@@ -594,20 +629,83 @@ func (p *parser) localFunction() {
 	p.function.LocalVariable(p.body(false, p.lineNumber).info).startPC = pc(len(p.function.f.code))
 }
 
+// getLocalAttribute parses an optional <const> or <close> attribute after a local variable name.
+func (p *parser) getLocalAttribute() byte {
+	if p.t != '<' {
+		return varRegular
+	}
+	p.next() // skip '<'
+	attr := p.checkName()
+	p.checkNext('>')
+	switch attr {
+	case "const":
+		return varConst
+	case "close":
+		return varToClose
+	default:
+		p.syntaxError("unknown attribute '" + attr + "'")
+		return varRegular
+	}
+}
+
 func (p *parser) localStatement() {
 	v := 0
+	kinds := make([]byte, 0, 4)
+	toclose := -1
 	for first := true; first || p.testNext(','); v++ {
 		p.function.MakeLocalVariable(p.checkName())
+		kind := p.getLocalAttribute()
+		kinds = append(kinds, kind)
+		if kind == varToClose {
+			if toclose != -1 {
+				p.syntaxError("multiple to-be-closed variables in local statement")
+			}
+			toclose = v
+		}
 		first = false
 	}
+	isCTC := false
 	if p.testNext('=') {
 		e, n := p.expressionList()
-		p.function.AdjustAssignment(v, n, e)
+		// Check for compile-time constant: nvars == nexps, last var is <const>,
+		// and last expression is a compile-time constant.
+		if n == v && kinds[v-1] == varConst {
+			if constVal, ok := p.function.exp2const(e); ok {
+				// CTC path: last variable is a compile-time constant
+				kinds[v-1] = varCTC
+				isCTC = true
+				// Adjust only the first v-1 variables (they're already in registers)
+				p.function.AdjustLocalVariables(v - 1)
+				// Count the CTC variable as active but without a register
+				p.function.activeVariableCount++
+				ctcVar := p.function.LocalVariable(p.function.activeVariableCount - 1)
+				ctcVar.val = constVal
+				ctcVar.startPC = pc(len(p.function.f.code))
+			}
+		}
+		if !isCTC {
+			p.function.AdjustAssignment(v, n, e)
+		}
 	} else {
+		if toclose != -1 {
+			p.syntaxError("to-be-closed variable must have a close value")
+		}
 		var e exprDesc
 		p.function.AdjustAssignment(v, 0, e)
 	}
-	p.function.AdjustLocalVariables(v)
+	if !isCTC {
+		p.function.AdjustLocalVariables(v)
+	}
+	// Set kinds on the local variables
+	for i, k := range kinds {
+		p.function.LocalVariable(p.function.activeVariableCount - v + i).kind = k
+	}
+	// Emit TBC opcode if needed
+	if toclose != -1 {
+		p.function.markToBeClose()
+		tocloseScopeLevel := p.function.activeVariableCount - v + toclose
+		p.function.EncodeABC(opTBC, p.function.varToReg(tocloseScopeLevel), 0, 0)
+	}
 }
 
 func (p *parser) expressionStatement() {
@@ -662,12 +760,12 @@ func (p *parser) statement() {
 		p.next()
 		p.returnStatement()
 	case tkBreak, tkGoto:
-		p.gotoStatement(p.function.Jump())
+		p.gotoStatement()
 	default:
 		p.expressionStatement()
 	}
-	p.assert(p.function.f.maxStackSize >= p.function.freeRegisterCount && p.function.freeRegisterCount >= p.function.activeVariableCount)
-	p.function.freeRegisterCount = p.function.activeVariableCount
+	p.assert(p.function.f.maxStackSize >= p.function.freeRegisterCount && p.function.freeRegisterCount >= p.function.regLevel())
+	p.function.freeRegisterCount = p.function.regLevel()
 	p.leaveLevel()
 }
 

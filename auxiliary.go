@@ -11,15 +11,40 @@ import (
 func functionName(l *State, d Debug) string {
 	switch {
 	case d.NameKind != "":
-		return fmt.Sprintf("function '%s'", d.Name)
+		return fmt.Sprintf("%s '%s'", d.NameKind, d.Name)
 	case d.What == "main":
 		return "main chunk"
-	case d.What == "Go":
+	case d.What == "C":
 		if pushGlobalFunctionName(l, d.callInfo) {
 			s, _ := l.ToString(-1)
 			l.Pop(1)
 			return fmt.Sprintf("function '%s'", s)
 		}
+		return "?"
+	}
+	return fmt.Sprintf("function <%s:%d>", d.ShortSource, d.LineDefined)
+}
+
+// tracebackFuncName returns a function name for use in tracebacks.
+// Unlike functionName, it uses a shallow (level=1) global table search
+// to avoid the expensive recursive search that can be slow with large tables.
+func tracebackFuncName(l *State, d Debug) string {
+	switch {
+	case d.NameKind != "":
+		return fmt.Sprintf("%s '%s'", d.NameKind, d.Name)
+	case d.What == "main":
+		return "main chunk"
+	case d.What == "C":
+		// Shallow global name search (level=1, no recursion into sub-tables)
+		top := l.Top()
+		l.apiPush(l.stack[d.callInfo.function])
+		l.PushGlobalTable()
+		if findField(l, top+1, 1) {
+			s, _ := l.ToString(-1)
+			l.SetTop(top)
+			return fmt.Sprintf("function '%s'", s)
+		}
+		l.SetTop(top)
 		return "?"
 	}
 	return fmt.Sprintf("function <%s:%d>", d.ShortSource, d.LineDefined)
@@ -46,11 +71,11 @@ func countLevels(l *State) int {
 // nil it is appended at the beginning of the traceback. The level parameter
 // tells at which level to start the traceback.
 func Traceback(l, l1 *State, message string, level int) {
-	const levels1, levels2 = 12, 10
+	const levels1, levels2 = 10, 11
 	levels := countLevels(l1)
-	mark := 0
-	if levels > levels1+levels2 {
-		mark = levels1
+	limit2show := -1
+	if levels-level > levels1+levels2 {
+		limit2show = levels1
 	}
 	buf := message
 	if buf != "" {
@@ -58,16 +83,20 @@ func Traceback(l, l1 *State, message string, level int) {
 	}
 	buf += "stack traceback:"
 	for f, ok := Stack(l1, level); ok; f, ok = Stack(l1, level) {
-		if level++; level == mark {
-			buf += "\n\t..."
-			level = levels - levels2
+		level++
+		old := limit2show
+		limit2show--
+		if old == 0 { // too many levels?
+			n := levels - level - levels2 + 1
+			buf += fmt.Sprintf("\n\t...\t(skipping %d levels)", n)
+			level += n
 		} else {
 			d, _ := Info(l1, "Slnt", f)
 			buf += "\n\t" + d.ShortSource + ":"
 			if d.CurrentLine > 0 {
 				buf += fmt.Sprintf("%d:", d.CurrentLine)
 			}
-			buf += " in " + functionName(l, d)
+			buf += " in " + tracebackFuncName(l1, d)
 			if d.IsTailCall {
 				buf += "\n\t(...tail calls...)"
 			}
@@ -166,6 +195,13 @@ func pushGlobalFunctionName(l *State, f Frame) bool {
 	Info(l, "f", f) // push function
 	l.PushGlobalTable()
 	if findField(l, top+1, 2) {
+		name, _ := l.ToString(-1)
+		// Strip "_G." prefix (matches C Lua behavior)
+		if len(name) > 3 && name[:3] == "_G." {
+			name = name[3:]
+			l.Pop(1)
+			l.PushString(name)
+		}
 		l.Copy(-1, top+1) // move name to proper place
 		l.Pop(2)          // remove pushed values
 		return true
@@ -527,7 +563,14 @@ func LoadFile(l *State, fileName, mode string) error {
 		l.SetTop(fileNameIndex)
 		return fileError("read")
 	} else if skipped {
-		r = bufio.NewReader(io.MultiReader(strings.NewReader("\n"), r))
+		// After skipping a # comment, check if the remaining data is binary.
+		// If so, don't prepend \n (it would break binary signature detection).
+		if peek, err := r.Peek(1); err == nil && len(peek) > 0 && peek[0] == Signature[0] {
+			// Binary data follows — leave reader as-is
+		} else {
+			// Text data — prepend \n to maintain line numbering
+			r = bufio.NewReader(io.MultiReader(strings.NewReader("\n"), r))
+		}
 	}
 	s, _ := l.ToString(-1)
 	err := l.Load(r, s, mode)

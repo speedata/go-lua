@@ -65,7 +65,7 @@ func TestLua(t *testing.T) {
 		{name: "code"},
 		{name: "constructs"},
 		{name: "coroutine"},
-		// {name: "db"},          // Needs debug.getlocal for coroutines, etc.
+		{name: "db"},
 		{name: "errors"},
 		{name: "events"},
 		{name: "files"},
@@ -75,12 +75,12 @@ func TestLua(t *testing.T) {
 		{name: "locals"},
 		// {name: "main"},        // Requires command-line Lua
 		{name: "math"},
-		// {name: "nextvar"}, // TODO: hangs on some test (not the metamethods part)
+		{name: "nextvar"},
 		{name: "pm"},
 		{name: "sort", nonPort: true},
 		{name: "strings"},
-		{name: "tpack"}, // Lua 5.3: string.pack/unpack tests
-		{name: "utf8"},  // Lua 5.3: utf8 library tests
+		{name: "tpack"}, // Lua 5.4: string.pack/unpack tests
+		{name: "utf8"},  // Lua 5.4: utf8 library tests
 		{name: "vararg"},
 		// {name: "verybig"},     // Very slow/memory intensive
 	}
@@ -91,10 +91,15 @@ func TestLua(t *testing.T) {
 		t.Log(v)
 		l := NewState()
 		OpenLibraries(l)
-		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_noGC", "_noBuffering", "_noStringDump"} {
+		for _, s := range []string{"_port", "_no32", "_noformatA", "_noweakref", "_noGC", "_noBuffering", "_nocoroutine", "_soft", "_noMultiUserValue", "_noTransferInfo"} {
 			l.PushBoolean(true)
 			l.SetGlobal(s)
 		}
+		// Set package.path to include lua-tests/ for require
+		l.Global("package")
+		l.PushString("./?.lua;./lua-tests/?.lua")
+		l.SetField(-2, "path")
+		l.Pop(1)
 		if v.nonPort {
 			l.PushBoolean(false)
 			l.SetGlobal("_port")
@@ -456,7 +461,7 @@ func TestLocIsCorrectOnError(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error! Got none... :(")
 	} else {
-		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value (global 'q')" {
+		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value" {
 			t.Errorf("Wrong error reported: %v", err)
 		}
 	}

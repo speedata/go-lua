@@ -114,8 +114,8 @@ const MinStack = 20
 
 const (
 	VersionMajor  = 5
-	VersionMinor  = 3
-	VersionNumber = 503
+	VersionMinor  = 4
+	VersionNumber = 504
 	VersionString = "Lua " + string('0'+VersionMajor) + "." + string('0'+VersionMinor)
 )
 
@@ -185,6 +185,12 @@ type Debug struct {
 	// In this case, the caller of this level is not in the stack.
 	IsTailCall bool
 
+	// FTransfer is the index of the first value being "transferred" (in a call or return).
+	FTransfer int
+
+	// NTransfer is the number of values being transferred.
+	NTransfer int
+
 	// callInfo is the active function.
 	callInfo *callInfo
 }
@@ -251,6 +257,9 @@ type State struct {
 	protectFunction       func()
 	status                threadStatus
 	caller                *State // the State that called Resume on this thread
+	tbcList               []int  // Lua 5.4: stack indices of to-be-closed variables
+	hasError              bool   // Lua 5.4: coroutine died with an unhandled error (for coroutine.close)
+	warnEnabled           bool   // Lua 5.4: whether warn() output is enabled (per-State)
 }
 
 type globalState struct {
@@ -422,11 +431,14 @@ func (l *State) ProtectedCallWithContinuation(argCount, resultCount, errorFuncti
 	if continuation == nil || l.nonYieldableCallCount > 0 {
 		err = l.protectedCall(func() { l.call(f, resultCount, false) }, f, errorFunction)
 	} else {
+		// Yieldable pcall: like C Lua's lua_pcallk, call directly without
+		// local error protection. Errors and yields propagate to Resume's
+		// recovery loop, which handles TBC closing yieldably via finishCcall.
 		c := l.callInfo
 		c.continuation, c.context, c.extra, c.oldAllowHook, c.oldErrorFunction = continuation, context, f, l.allowHook, l.errorFunction
 		l.errorFunction = errorFunction
 		l.callInfo.setCallStatus(callStatusYieldableProtected)
-		err = l.protectedCallYieldable(func() { l.call(f, resultCount, true) }, f, errorFunction)
+		l.call(f, resultCount, true)
 		l.callInfo.clearCallStatus(callStatusYieldableProtected)
 		l.errorFunction = c.oldErrorFunction
 	}
@@ -440,10 +452,6 @@ func (l *State) ProtectedCallWithContinuation(argCount, resultCount, errorFuncti
 //
 // http://www.lua.org/manual/5.2/manual.html#lua_load
 func (l *State) Load(r io.Reader, chunkName string, mode string) error {
-	if chunkName == "" {
-		chunkName = "?"
-	}
-
 	if err := protectedParser(l, r, chunkName, mode); err != nil {
 		return err
 	}
@@ -459,10 +467,11 @@ func (l *State) Load(r io.Reader, chunkName string, mode string) error {
 // results in a function equivalent to the one dumped.
 //
 // http://www.lua.org/manual/5.3/manual.html#lua_dump
-func (l *State) Dump(w io.Writer) error {
+func (l *State) Dump(w io.Writer, strip ...bool) error {
 	l.checkElementCount(1)
+	s := len(strip) > 0 && strip[0]
 	if f, ok := l.stack[l.top-1].(*luaClosure); ok {
-		return l.dump(f.prototype, w)
+		return l.dump(f.prototype, w, s)
 	}
 	panic("closure expected")
 }
@@ -585,6 +594,7 @@ func (l *State) Resume(from *State, nArgs int) (err error) {
 		if !l.recoverFromError(err) {
 			// No recovery point - error is fatal
 			l.status = threadStatusDead
+			l.hasError = true
 			break
 		}
 		// Run unroll with error status (the recovered pcall frame's
@@ -616,7 +626,13 @@ func (l *State) Resume(from *State, nArgs int) (err error) {
 // resumeRun executes the resume logic in a protected context (defer/recover).
 func (l *State) resumeRun(nArgs int) (err error) {
 	func() {
+		// Set protectFunction so throw() panics on this coroutine
+		// instead of delegating to the main thread (which would lose
+		// the original Lua error value and corrupt the main stack).
+		savedProtect := l.protectFunction
+		l.protectFunction = func() {} // non-nil sentinel
 		defer func() {
+			l.protectFunction = savedProtect
 			if r := recover(); r != nil {
 				if r == yieldError {
 					return // coroutine yielded successfully
@@ -669,14 +685,22 @@ func (l *State) finishOp() {
 	ci := l.callInfo
 	inst := ci.code[ci.savedPC-1] // interrupted instruction
 	switch inst.opCode() {
-	case opAdd, opSub, opMul, opDiv, opIDiv,
-		opBAnd, opBOr, opBXor, opShl, opShr,
-		opMod, opPow,
-		opUnaryMinus, opBNot, opLength,
-		opGetTableUp, opGetTable, opSelf:
+	case opMMBin, opMMBinI, opMMBinK:
+		// TM result is at top of stack; store in R[A] of the PREVIOUS instruction
+		// (the arithmetic instruction before the MMBIN)
+		l.top--
+		pi := ci.code[ci.savedPC-2]
+		ci.frame[pi.a()] = l.stack[l.top]
+	case opUnaryMinus, opBNot, opLength,
+		opGetTableUp, opGetTable, opGetI, opGetField, opSelf:
+		// TM result is at top of stack; store in R[A]
 		l.top--
 		ci.frame[inst.a()] = l.stack[l.top]
-	case opLessOrEqual, opLessThan, opEqual:
+	case opLessThan, opLessOrEqual,
+		opLessThanI, opLessOrEqualI,
+		opGreaterThanI, opGreaterOrEqualI,
+		opEqual:
+		// Note: opEqualI and opEqualK cannot yield
 		res := !isFalse(l.stack[l.top-1])
 		l.top--
 		// "<=" using "<" with swapped args? Negate result.
@@ -684,29 +708,35 @@ func (l *State) finishOp() {
 			ci.clearCallStatus(callStatusLEQ)
 			res = !res
 		}
-		// The next instruction should be a jump
-		if (res && inst.a() == 0) || (!res && inst.a() != 0) {
+		// Next instruction must be a JMP; skip it if condition failed
+		if res != (inst.k() != 0) {
 			ci.savedPC++ // skip jump instruction
 		}
 	case opConcat:
-		top := l.top - 1             // position where TM result is
-		b := inst.b()
-		base := ci.base()
-		total := top - 1 - (base + b) // remaining elements to concat
-		l.stack[top-2] = l.stack[top]  // put TM result in proper position
+		top := l.top - 1                   // top when TM was called
+		a := inst.a()                      // first element to concatenate
+		total := top - 1 - (ci.base() + a) // yet to concatenate
+		l.stack[top-2] = l.stack[top]      // put TM result in proper position
+		l.top = top - 1                    // top is one after last element
 		if total > 1 {
-			l.top = top - 1
 			l.concat(total) // concat remaining (may yield again)
 		}
-		ci.frame[inst.a()] = l.stack[l.top-1] // move final result
-		l.top = ci.top                         // restore top
+		ci.frame[a] = l.stack[l.top-1] // move final result
+		l.top = ci.top                  // restore top
+	case opClose, opReturn0, opReturn1:
+		// yielded closing variables — repeat instruction to close others
+		ci.savedPC--
+	case opReturn:
+		// yielded closing variables — restore l.top and repeat instruction
+		l.top = ci.savedTop
+		ci.savedPC--
 	case opTForCall:
 		l.top = ci.top // correct top
 	case opCall:
 		if inst.c()-1 >= 0 { // nresults >= 0?
 			l.top = ci.top // adjust results
 		}
-	case opTailCall, opSetTableUp, opSetTable:
+	case opTailCall, opSetTableUp, opSetTable, opSetI, opSetField:
 		// nothing to do
 	}
 }
@@ -716,6 +746,32 @@ func (l *State) finishOp() {
 // shouldYield=true means normal yield resume, shouldYield=false means error recovery.
 func (l *State) finishCcall(shouldYield bool, status error) {
 	ci := l.callInfo
+	// Handle pcall error recovery: close remaining TBCs yieldably
+	// (like C Lua's finishpcallk which calls luaF_close with yy=1).
+	// If a __close handler yields, the yield propagates up. On re-resume,
+	// unroll calls finishCcall again; recoverStatus is still set, but
+	// closeTBCWithErr is a no-op (already-closed TBCs were popped).
+	if ci.recoverStatus != nil {
+		oldTop := ci.extra
+		l.allowHook = ci.oldAllowHook
+		// Close remaining TBCs yieldably — may yield or error
+		l.closeTBCWithErr(oldTop, ci.recoverErrObj, true)
+		// All TBCs closed — set error object at oldTop
+		switch ci.recoverStatus {
+		case MemoryError:
+			l.stack[oldTop] = l.global.memoryErrorMessage
+		case ErrorError:
+			l.stack[oldTop] = "error in error handling"
+		default:
+			l.stack[oldTop] = ci.recoverErrObj
+		}
+		l.top = oldTop + 1
+		l.shrinkStack()
+		status = ci.recoverStatus
+		shouldYield = false
+		ci.recoverStatus = nil
+		ci.recoverErrObj = nil
+	}
 	if ci.isCallStatus(callStatusYieldableProtected) {
 		ci.clearCallStatus(callStatusYieldableProtected)
 		l.errorFunction = ci.oldErrorFunction
@@ -742,14 +798,22 @@ func (l *State) findpcall() *callInfo {
 // recoverFromError recovers from an error in a coroutine by finding a
 // yieldable protected call frame (pcall/xpcall with continuation) and
 // resetting state to that frame. Returns true if recovery was possible.
+// TBC variables are NOT closed here — finishCcall handles them yieldably
+// (like C Lua's finishpcallk which calls luaF_close with yy=1).
 func (l *State) recoverFromError(status error) bool {
 	ci := l.findpcall()
 	if ci == nil {
 		return false
 	}
 	oldTop := ci.extra
-	l.close(oldTop)
-	l.setErrorObject(status, oldTop)
+	var errObj value
+	if l.top > oldTop {
+		errObj = l.stack[l.top-1]
+	}
+	l.closeUpValues(oldTop)
+	// Store recovery info for finishCcall to close TBCs yieldably
+	ci.recoverStatus = status
+	ci.recoverErrObj = errObj
 	l.callInfo = ci
 	l.allowHook = ci.oldAllowHook
 	l.nonYieldableCallCount = 0
@@ -1576,39 +1640,23 @@ func (l *State) protectedCall(f func(), oldTop, errorFunc int) error {
 	l.errorFunction = errorFunc
 	err := l.protect(f)
 	if err != nil {
-		l.close(oldTop)
-		l.setErrorObject(err, oldTop)
 		l.callInfo, l.allowHook, l.nonYieldableCallCount = callInfo, allowHook, nonYieldableCallCount
+		// Extract error value from stack before closing TBC variables
+		var errObj value
+		if l.top > oldTop {
+			errObj = l.stack[l.top-1]
+		}
+		// Close upvalues (safe, no errors possible)
+		l.closeUpValues(oldTop)
+		// Close TBC variables in protected mode with error chaining
+		// (like C Lua's luaD_closeprotected in luaD_pcall)
+		if finalErr := l.closeTBCProtected(oldTop, errObj); finalErr != nil {
+			// A __close handler threw — push the chained error so
+			// setErrorObject picks it up from l.stack[l.top-1]
+			l.push(finalErr)
+		}
+		l.setErrorObject(err, oldTop)
 		l.shrinkStack()
-	}
-	l.errorFunction = errorFunction
-	return err
-}
-
-// protectedCallYieldable is like protectedCall but allows yield panics to propagate.
-func (l *State) protectedCallYieldable(f func(), oldTop, errorFunc int) (err error) {
-	callInfo, allowHook, nonYieldableCallCount, errorFunction := l.callInfo, l.allowHook, l.nonYieldableCallCount, l.errorFunction
-	l.errorFunction = errorFunc
-	func() {
-		defer func() {
-			if e := recover(); e != nil {
-				// Let yield errors propagate through
-				if e == yieldError {
-					panic(e)
-				}
-				if errVal, ok := e.(error); ok {
-					err = errVal
-				} else {
-					err = fmt.Errorf("%v", e)
-				}
-			}
-		}()
-		f()
-	}()
-	if err != nil {
-		l.close(oldTop)
-		l.setErrorObject(err, oldTop)
-		l.callInfo, l.allowHook, l.nonYieldableCallCount = callInfo, allowHook, nonYieldableCallCount
 	}
 	l.errorFunction = errorFunction
 	return err
@@ -1624,6 +1672,9 @@ func UpValue(l *State, function, index int) (name string, ok bool) {
 		if ok = 1 <= index && index <= c.upValueCount(); ok {
 			if c, isLua := c.(*luaClosure); isLua {
 				name = c.prototype.upValues[index-1].name
+				if name == "" {
+					name = "(no name)"
+				}
 			}
 			l.apiPush(c.upValue(index - 1))
 		}
@@ -1644,6 +1695,9 @@ func SetUpValue(l *State, function, index int) (name string, ok bool) {
 		if ok = 1 <= index && index <= c.upValueCount(); ok {
 			if c, isLua := c.(*luaClosure); isLua {
 				name = c.prototype.upValues[index-1].name
+				if name == "" {
+					name = "(no name)"
+				}
 			}
 			l.top--
 			c.setUpValue(index-1, l.stack[l.top])

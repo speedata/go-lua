@@ -204,6 +204,8 @@ func forLimit(limitVal value, step int64) (int64, bool) {
 type localVariable struct {
 	name           string
 	startPC, endPC pc
+	kind           byte  // 0=regular, 1=const, 2=toclose, 3=CTC
+	val            value // compile-time constant value (only for kind==varCTC)
 }
 
 type userData struct {
@@ -215,6 +217,7 @@ type upValueDesc struct {
 	name    string
 	isLocal bool
 	index   int
+	kind    byte // Lua 5.4: upvalue kind
 }
 
 type stackLocation struct {
@@ -222,11 +225,17 @@ type stackLocation struct {
 	index int
 }
 
+// absLineInfo stores absolute line info entries for Lua 5.4 split lineinfo
+type absLineInfo struct {
+	pc, line int
+}
+
 type prototype struct {
 	constants                    []value
 	code                         []instruction
 	prototypes                   []prototype
-	lineInfo                     []int32
+	lineInfo                     []int8  // Lua 5.4: relative line info
+	absLineInfos                 []absLineInfo // Lua 5.4: absolute line info
 	localVariables               []localVariable
 	upValues                     []upValueDesc
 	cache                        *luaClosure
@@ -244,6 +253,12 @@ func (p *prototype) upValueName(index int) string {
 }
 
 func (p *prototype) lastLoad(reg int, lastPC pc) (loadPC pc, found bool) {
+	// If the instruction at lastPC is a metamethod instruction (MMBIN, etc.),
+	// skip it — it was not actually executed, and the previous arithmetic
+	// instruction is what we want to look past. This matches C Lua's findsetreg.
+	if lastPC > 0 && testMMMode(p.code[lastPC].opCode()) {
+		lastPC--
+	}
 	var ip, jumpTarget pc
 	for ; ip < lastPC; ip++ {
 		i, maybe := p.code[ip], false
@@ -255,7 +270,8 @@ func (p *prototype) lastLoad(reg int, lastPC pc) (loadPC pc, found bool) {
 		case opCall, opTailCall:
 			maybe = reg >= i.a()
 		case opJump:
-			if dest := ip + 1 + pc(i.sbx()); ip < dest && dest <= lastPC && dest > jumpTarget {
+			// Lua 5.4: JMP uses sJ format
+			if dest := ip + 1 + pc(i.sJ()); ip < dest && dest <= lastPC && dest > jumpTarget {
 				jumpTarget = dest
 			}
 		case opTest:
@@ -293,13 +309,19 @@ func (p *prototype) objectName(reg int, lastPC pc) (name, kind string) {
 				kind = "field"
 			}
 			return
-		case opGetTable:
+		case opGetField:
+			// Lua 5.4: GETFIELD A B C — key is K[C]
 			name = p.constantName(i.c(), pc)
 			if v, ok := p.localName(i.b()+1, pc); ok && v == "_ENV" {
 				kind = "global"
 			} else {
 				kind = "field"
 			}
+			return
+		case opGetTable, opGetI:
+			// Lua 5.4: GETTABLE key=R[C], GETI key=integer C
+			kind = "field"
+			name = "?"
 			return
 		case opGetUpValue:
 			return p.upValueName(i.b()), "upvalue"
@@ -319,12 +341,11 @@ func (p *prototype) objectName(reg int, lastPC pc) (name, kind string) {
 }
 
 func (p *prototype) constantName(k int, pc pc) string {
-	if isConstant(k) {
-		if s, ok := p.constants[constantIndex(k)].(string); ok {
+	// Lua 5.4: k is always a constant index (no RK encoding)
+	if k >= 0 && k < len(p.constants) {
+		if s, ok := p.constants[k].(string); ok {
 			return s
 		}
-	} else if name, kind := p.objectName(k, pc); kind == "constant" {
-		return name
 	}
 	return "?"
 }
@@ -338,6 +359,19 @@ func (p *prototype) localName(index int, pc pc) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// localKind returns the kind of local variable at the given 1-based index
+// active at the given pc. Returns 0 (varRegular) if not found.
+func (p *prototype) localKind(index int, pc pc) byte {
+	for i := 0; i < len(p.localVariables) && p.localVariables[i].startPC <= pc; i++ {
+		if pc < p.localVariables[i].endPC {
+			if index--; index == 0 {
+				return p.localVariables[i].kind
+			}
+		}
+	}
+	return varRegular
 }
 
 // Converts an integer to a "floating point byte", represented as

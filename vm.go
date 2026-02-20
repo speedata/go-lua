@@ -41,12 +41,45 @@ func (l *State) coerceToIntegers(b, c value) (ib, ic int64, ok bool) {
 	return
 }
 
-// intIDiv performs integer floor division (Lua 5.3 // operator).
-// Returns floor(a/b), handling negative numbers correctly.
-func intIDiv(m, n int64) int64 {
-	if n == 0 {
-		return 0 // Lua returns nan for float, but we handle it here
+// valueTypeName returns the Lua type name of a Go value,
+// checking __name in the metatable for tables and userdata.
+func (l *State) valueTypeName(v value) string {
+	switch val := v.(type) {
+	case nil:
+		return "nil"
+	case bool:
+		return "boolean"
+	case int64:
+		return "number"
+	case float64:
+		return "number"
+	case string:
+		return "string"
+	case *table:
+		if val.metaTable != nil {
+			if s, ok := val.metaTable.atString("__name").(string); ok {
+				return s
+			}
+		}
+		return "table"
+	case *luaClosure, *goClosure, *goFunction:
+		return "function"
+	case *userData:
+		if val.metaTable != nil {
+			if s, ok := val.metaTable.atString("__name").(string); ok {
+				return s
+			}
+		}
+		return "userdata"
+	default:
+		return "no value"
 	}
+}
+
+// intIDiv performs integer floor division (Lua 5.4 // operator).
+// Returns floor(a/b), handling negative numbers correctly.
+// Caller must ensure n != 0.
+func intIDiv(m, n int64) int64 {
 	q := m / n
 	// Adjust for floor division when signs differ
 	if (m^n) < 0 && m%n != 0 {
@@ -55,12 +88,10 @@ func intIDiv(m, n int64) int64 {
 	return q
 }
 
-// intMod performs integer modulo (Lua 5.3 % operator).
+// intMod performs integer modulo (Lua 5.4 % operator).
 // Uses the definition: a % b == a - (a // b) * b
+// Caller must ensure n != 0.
 func intMod(m, n int64) int64 {
-	if n == 0 {
-		return 0 // Avoid division by zero
-	}
 	return m - intIDiv(m, n)*n
 }
 
@@ -114,6 +145,18 @@ func (l *State) bitwiseArith(rb, rc value, op tm) value {
 	// No metamethod - produce appropriate error
 	l.bitwiseError(rb, rc)
 	return nil
+}
+
+// arithOrBitwise dispatches to either arith or bitwiseArith based on the
+// tag method type. Binary MMBIN opcodes need this to produce correct error
+// messages ("bitwise operation" vs "arithmetic").
+func (l *State) arithOrBitwise(rb, rc value, op tm) value {
+	switch op {
+	case tmBAnd, tmBOr, tmBXor, tmShl, tmShr:
+		return l.bitwiseArith(rb, rc, op)
+	default:
+		return l.arith(rb, rc, op)
+	}
 }
 
 func (l *State) tableAt(t value, key value) value {
@@ -506,8 +549,49 @@ func (l *State) concat(total int) {
 	}
 }
 
+// maxIWTHABS is the maximum interval without absolute line info.
+const maxIWTHABS = 128
+
+// getBaseline finds the baseline (pc, line) for a given instruction PC using absLineInfos.
+func getBaseline(p *prototype, pc int) (int, int) {
+	if len(p.absLineInfos) == 0 || pc < p.absLineInfos[0].pc {
+		return -1, p.lineDefined
+	}
+	// Binary search
+	lo, hi := 0, len(p.absLineInfos)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if p.absLineInfos[mid].pc <= pc {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return p.absLineInfos[lo].pc, p.absLineInfos[lo].line
+}
+
+// getFuncLine resolves a PC to a line number using Lua 5.4 split lineinfo.
+func getFuncLine(p *prototype, pc int) int {
+	if len(p.lineInfo) == 0 {
+		return -1
+	}
+	basePC, baseLine := getBaseline(p, pc)
+	for basePC < pc {
+		basePC++
+		baseLine += int(p.lineInfo[basePC])
+	}
+	return baseLine
+}
+
 func (l *State) traceExecution() {
 	callInfo := l.callInfo
+	// For vararg functions, skip tracing during VARARGPREP instruction.
+	// Matches C Lua where trap=0 during VARARGPREP; hooks start after it.
+	if callInfo.savedPC == 0 {
+		if p := l.prototype(callInfo); p.isVarArg {
+			return
+		}
+	}
 	mask := l.hookMask
 	countHook := mask&MaskCount != 0 && l.hookCount == 0
 	if countHook {
@@ -522,10 +606,15 @@ func (l *State) traceExecution() {
 	}
 	if mask&MaskLine != 0 {
 		p := l.prototype(callInfo)
-		npc := callInfo.savedPC - 1
-		newline := p.lineInfo[npc]
-		if npc == 0 || callInfo.savedPC <= l.oldPC || newline != p.lineInfo[l.oldPC-1] {
-			l.hook(HookLine, int(newline))
+		npc := callInfo.savedPC // index of instruction about to execute
+		newline := getFuncLine(p, int(npc))
+		// L->oldpc may be invalid; use zero in this case (matches C Lua)
+		oldpc := l.oldPC
+		if int(oldpc) >= len(p.code) {
+			oldpc = 0
+		}
+		if callInfo.savedPC <= oldpc || newline != getFuncLine(p, int(oldpc)) {
+			l.hook(HookLine, newline)
 		}
 	}
 	l.oldPC = callInfo.savedPC
@@ -540,27 +629,92 @@ func (l *State) traceExecution() {
 	}
 }
 
-type engine struct {
-	frame     []value
-	closure   *luaClosure
-	constants []value
-	callInfo  *callInfo
-	l         *State
+// rkc returns constants[C] if the k-bit is set, else frame[C].
+// Used by SET opcodes where the value can be a constant or register.
+func rkc(i instruction, constants []value, frame []value) value {
+	if i.k() != 0 {
+		return constants[i.c()]
+	}
+	return frame[i.c()]
 }
 
-func (e *engine) k(field int) value {
-	if field&bitRK != 0 { // OPT: Inline isConstant(field).
-		return e.constants[field & ^bitRK] // OPT: Inline constantIndex(field).
+// forLimit54 converts the for-loop limit to integer and checks if the loop should be skipped.
+// This implements Lua 5.4's forlimit() function.
+// For positive step, the limit is floored; for negative step, it is ceiled.
+// This matches C Lua's use of F2Ifloor/F2Iceil in luaV_tointeger.
+func (l *State) forLimit54(limitVal value, init, step int64) (int64, bool) {
+	switch limit := limitVal.(type) {
+	case int64:
+		if step > 0 {
+			return limit, init > limit
+		}
+		return limit, init < limit
+	case float64:
+		// Convert float limit to integer using floor (step>0) or ceil (step<0).
+		// This matches C Lua's forlimit which uses F2Ifloor/F2Iceil.
+		var iLimit int64
+		if step < 0 {
+			iLimit = int64(math.Ceil(limit))
+		} else {
+			iLimit = int64(math.Floor(limit))
+		}
+		// Check if the conversion is within integer range
+		if limit >= float64(minInt64) && limit <= float64(maxInt64) {
+			if step > 0 {
+				return iLimit, init > iLimit
+			}
+			return iLimit, init < iLimit
+		}
+		// Float is out of integer range
+		if limit > 0 {
+			if step < 0 {
+				return 0, true // positive limit out of range with descending step → skip
+			}
+			return maxInt64, init > maxInt64
+		}
+		if step > 0 {
+			return 0, true // negative limit out of range with ascending step → skip
+		}
+		return minInt64, init < minInt64
+	case string:
+		if f, ok := l.toNumber(limit); ok {
+			return l.forLimit54(f, init, step)
+		}
 	}
-	return e.frame[field]
+	l.runtimeError(fmt.Sprintf("bad 'for' limit (number expected, got %s)", l.valueTypeName(limitVal)))
+	return 0, true
 }
 
-func (e *engine) expectNext(expected opCode) instruction {
-	i := e.callInfo.step() // go to next instruction
-	if op := i.opCode(); op != expected {
-		panic(fmt.Sprintf("expected opcode %s, got %s", opNames[expected], opNames[op]))
+// callOrderImmediate calls order metamethods for immediate comparison opcodes.
+// flip=true means the arguments are swapped (for GTI/GEI).
+func (l *State) callOrderImmediate(ra value, imm int, flip bool, isFloat bool, event tm) bool {
+	var p2 value
+	if isFloat {
+		p2 = float64(imm)
+	} else {
+		p2 = int64(imm)
 	}
-	return i
+	if flip {
+		result, ok := l.callOrderTagMethod(p2, ra, event)
+		if !ok {
+			l.orderError(p2, ra)
+		}
+		return result
+	}
+	result, ok := l.callOrderTagMethod(ra, p2, event)
+	if !ok {
+		l.orderError(ra, p2)
+	}
+	return result
+}
+
+// luaMod computes Lua's float modulo: a - floor(a/b)*b
+func luaMod(a, b float64) float64 {
+	r := math.Mod(a, b)
+	if r != 0 && (r > 0) != (b > 0) {
+		r += b
+	}
+	return r
 }
 
 func clear(r []value) {
@@ -569,902 +723,7 @@ func clear(r []value) {
 	}
 }
 
-func (e *engine) newFrame() {
-	ci := e.callInfo
-	// if internalCheck {
-	// 	e.l.assert(ci == e.l.callInfo.variant)
-	// }
-	e.frame = ci.frame
-	e.closure = e.l.stack[ci.function].(*luaClosure)
-	e.constants = e.closure.prototype.constants
-}
-
-func (e *engine) hooked() bool { return e.l.hookMask&(MaskLine|MaskCount) != 0 }
-
-func (e *engine) hook() {
-	if e.l.hookCount--; e.l.hookCount == 0 || e.l.hookMask&MaskLine != 0 {
-		e.l.traceExecution()
-		e.frame = e.callInfo.frame
-	}
-}
-
-type engineOp func(*engine, instruction) (engineOp, instruction)
-
-var jumpTable []engineOp
-
-func init() {
-	jumpTable = []engineOp{
-		func(e *engine, i instruction) (engineOp, instruction) { // opMove
-			e.frame[i.a()] = e.frame[i.b()]
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLoadConstant
-			e.frame[i.a()] = e.constants[i.bx()]
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLoadConstantEx
-			e.frame[i.a()] = e.constants[e.expectNext(opExtraArg).ax()]
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLoadBool
-			e.frame[i.a()] = i.b() != 0
-			if i.c() != 0 {
-				e.callInfo.skip()
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLoadNil
-			a, b := i.a(), i.b()
-			clear(e.frame[a : a+b+1])
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opGetUpValue
-			e.frame[i.a()] = e.closure.upValue(i.b())
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opGetTableUp
-			tmp := e.l.tableAt(e.closure.upValue(i.b()), e.k(i.c()))
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opGetTable
-			tmp := e.l.tableAt(e.frame[i.b()], e.k(i.c()))
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSetTableUp
-			e.l.setTableAt(e.closure.upValue(i.a()), e.k(i.b()), e.k(i.c()))
-			e.frame = e.callInfo.frame
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSetUpValue
-			e.closure.setUpValue(i.b(), e.frame[i.a()])
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSetTable
-			e.l.setTableAt(e.frame[i.a()], e.k(i.b()), e.k(i.c()))
-			e.frame = e.callInfo.frame
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opNewTable
-			a := i.a()
-			if b, c := float8(i.b()), float8(i.c()); b != 0 || c != 0 {
-				e.frame[a] = newTableWithSize(intFromFloat8(b), intFromFloat8(c))
-			} else {
-				e.frame[a] = newTable()
-			}
-			clear(e.frame[a+1:])
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSelf
-			a, t := i.a(), e.frame[i.b()]
-			tmp := e.l.tableAt(t, e.k(i.c()))
-			e.frame = e.callInfo.frame
-			e.frame[a+1], e.frame[a] = t, tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opAdd
-			b := e.k(i.b())
-			c := e.k(i.c())
-			// Try integer arithmetic first (Lua 5.3: int + int = int)
-			if ib, ic, ok := integerValues(b, c); ok {
-				e.frame[i.a()] = ib + ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = nb + nc
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmAdd)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSub
-			b := e.k(i.b())
-			c := e.k(i.c())
-			// Try integer arithmetic first (Lua 5.3: int - int = int)
-			if ib, ic, ok := integerValues(b, c); ok {
-				e.frame[i.a()] = ib - ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = nb - nc
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmSub)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opMul
-			b := e.k(i.b())
-			c := e.k(i.c())
-			// Try integer arithmetic first (Lua 5.3: int * int = int)
-			if ib, ic, ok := integerValues(b, c); ok {
-				e.frame[i.a()] = ib * ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = nb * nc
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmMul)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opMod (Lua 5.3: before POW)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			// Try integer arithmetic first (Lua 5.3: int % int = int)
-			if ib, ic, ok := integerValues(b, c); ok {
-				if ic == 0 {
-					e.l.runtimeError("attempt to perform 'n%0'")
-				}
-				e.frame[i.a()] = intMod(ib, ic)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = math.Mod(nb, nc)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmMod)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opPow
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = math.Pow(nb, nc)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmPow)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opDiv (Lua 5.3: after POW)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = nb / nc
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmDiv)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opIDiv (Lua 5.3: integer division)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := integerValues(b, c); ok {
-				// Check for division by zero
-				if ic == 0 {
-					e.l.runtimeError("attempt to divide by zero")
-				}
-				// Check for overflow: minint // -1 would overflow
-				if ib == math.MinInt64 && ic == -1 {
-					// Fall through to float division
-				} else {
-					e.frame[i.a()] = intIDiv(ib, ic)
-					if e.hooked() {
-						e.hook()
-					}
-					i = e.callInfo.step()
-					return jumpTable[i.opCode()], i
-				}
-			}
-			if nb, nc, ok := numericValues(b, c); ok {
-				e.frame[i.a()] = math.Floor(nb / nc)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.arith(b, c, tmIDiv)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opBAnd (Lua 5.3: bitwise AND)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
-				e.frame[i.a()] = ib & ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, c, tmBAnd)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opBOr (Lua 5.3: bitwise OR)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
-				e.frame[i.a()] = ib | ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, c, tmBOr)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opBXor (Lua 5.3: bitwise XOR)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
-				e.frame[i.a()] = ib ^ ic
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, c, tmBXor)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opShl (Lua 5.3: shift left)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
-				e.frame[i.a()] = intShiftLeft(ib, ic)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, c, tmShl)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opShr (Lua 5.3: shift right)
-			b := e.k(i.b())
-			c := e.k(i.c())
-			if ib, ic, ok := e.l.coerceToIntegers(b, c); ok {
-				e.frame[i.a()] = intShiftLeft(ib, -ic)
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, c, tmShr)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opUnaryMinus
-			b := e.frame[i.b()]
-			// Lua 5.3: preserve integer type unless overflow
-			if ib, ok := b.(int64); ok {
-				if ib == math.MinInt64 {
-					// -minint overflows, return float
-					e.frame[i.a()] = -float64(ib)
-				} else {
-					e.frame[i.a()] = -ib
-				}
-			} else if nb, ok := toFloat(b); ok {
-				e.frame[i.a()] = -nb
-			} else {
-				tmp := e.l.arith(b, b, tmUnaryMinus)
-				e.frame = e.callInfo.frame
-				e.frame[i.a()] = tmp
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opBNot (Lua 5.3: bitwise NOT)
-			b := e.frame[i.b()]
-			if ib, ok := e.l.toIntegerString(b); ok {
-				e.frame[i.a()] = ^ib
-				if e.hooked() {
-					e.hook()
-				}
-				i = e.callInfo.step()
-				return jumpTable[i.opCode()], i
-			}
-			tmp := e.l.bitwiseArith(b, b, tmBNot)
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opNot
-			e.frame[i.a()] = isFalse(e.frame[i.b()])
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLength
-			tmp := e.l.objectLength(e.frame[i.b()])
-			e.frame = e.callInfo.frame
-			e.frame[i.a()] = tmp
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opConcat
-			a, b, c := i.a(), i.b(), i.c()
-			e.l.top = e.callInfo.stackIndex(c + 1) // mark the end of concat operands
-			e.l.concat(c - b + 1)
-			e.frame = e.callInfo.frame
-			e.frame[a] = e.frame[b]
-			if a >= b { // limit of live values
-				clear(e.frame[a+1:])
-			} else {
-				clear(e.frame[b:])
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opJump
-			if a := i.a(); a > 0 {
-				e.l.close(e.callInfo.stackIndex(a - 1))
-			}
-			e.callInfo.jump(i.sbx())
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opEqual
-			test := i.a() != 0
-			result := e.l.equalObjects(e.k(i.b()), e.k(i.c()))
-			if result == test {
-				i := e.callInfo.step()
-				if a := i.a(); a > 0 {
-					e.l.close(e.callInfo.stackIndex(a - 1))
-				}
-				e.callInfo.jump(i.sbx())
-			} else {
-				e.callInfo.skip()
-			}
-			e.frame = e.callInfo.frame
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLessThan
-			test := i.a() != 0
-			result := e.l.lessThan(e.k(i.b()), e.k(i.c()))
-			if result == test {
-				i := e.callInfo.step()
-				if a := i.a(); a > 0 {
-					e.l.close(e.callInfo.stackIndex(a - 1))
-				}
-				e.callInfo.jump(i.sbx())
-			} else {
-				e.callInfo.skip()
-			}
-			e.frame = e.callInfo.frame
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opLessOrEqual
-			test := i.a() != 0
-			result := e.l.lessOrEqual(e.k(i.b()), e.k(i.c()))
-			if result == test {
-				i := e.callInfo.step()
-				if a := i.a(); a > 0 {
-					e.l.close(e.callInfo.stackIndex(a - 1))
-				}
-				e.callInfo.jump(i.sbx())
-			} else {
-				e.callInfo.skip()
-			}
-			e.frame = e.callInfo.frame
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opTest
-			test := i.c() == 0
-			if isFalse(e.frame[i.a()]) == test {
-				i := e.callInfo.step()
-				if a := i.a(); a > 0 {
-					e.l.close(e.callInfo.stackIndex(a - 1))
-				}
-				e.callInfo.jump(i.sbx())
-			} else {
-				e.callInfo.skip()
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opTestSet
-			b := e.frame[i.b()]
-			test := i.c() == 0
-			if isFalse(b) == test {
-				e.frame[i.a()] = b
-				i := e.callInfo.step()
-				if a := i.a(); a > 0 {
-					e.l.close(e.callInfo.stackIndex(a - 1))
-				}
-				e.callInfo.jump(i.sbx())
-			} else {
-				e.callInfo.skip()
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opCall
-			a, b, c := i.a(), i.b(), i.c()
-			if b != 0 {
-				e.l.top = e.callInfo.stackIndex(a + b)
-			} // else previous instruction set top
-			if n := c - 1; e.l.preCall(e.callInfo.stackIndex(a), n) { // go function
-				if n >= 0 {
-					e.l.top = e.callInfo.top // adjust results
-				}
-				e.frame = e.callInfo.frame
-			} else { // lua function
-				e.callInfo = e.l.callInfo
-				e.callInfo.setCallStatus(callStatusReentry)
-				e.newFrame()
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opTailCall
-			a, b := i.a(), i.b()
-			if b != 0 {
-				e.l.top = e.callInfo.stackIndex(a + b)
-			} // else previous instruction set top
-			// TODO e.l.assert(i.c()-1 == MultipleReturns)
-			if e.l.preCall(e.callInfo.stackIndex(a), MultipleReturns) { // go function
-				e.frame = e.callInfo.frame
-			} else {
-				// tail call: put called frame (n) in place of caller one (o)
-				nci := e.l.callInfo                    // called frame
-				oci := nci.previous                    // caller frame
-				nfn, ofn := nci.function, oci.function // called & caller function
-				// last stack slot filled by 'precall'
-				lim := nci.base() + e.l.stack[nfn].(*luaClosure).prototype.parameterCount
-				if len(e.closure.prototype.prototypes) > 0 { // close all upvalues from previous call
-					e.l.close(oci.base())
-				}
-				// move new frame into old one
-				for i := 0; nfn+i < lim; i++ {
-					e.l.stack[ofn+i] = e.l.stack[nfn+i]
-				}
-				base := ofn + (nci.base() - nfn)  // correct base
-				oci.setTop(ofn + (e.l.top - nfn)) // correct top
-				oci.frame = e.l.stack[base:oci.top]
-				oci.savedPC, oci.code = nci.savedPC, nci.code // correct code (savedPC indexes nci->code)
-				oci.setCallStatus(callStatusTail)             // function was tail called
-				e.l.top, e.l.callInfo, e.callInfo = oci.top, oci, oci
-				// TODO e.l.assert(e.l.top == oci.base()+e.l.stack[ofn].(*luaClosure).prototype.maxStackSize)
-				// TODO e.l.assert(&oci.frame[0] == &e.l.stack[oci.base()] && len(oci.frame) == oci.top-oci.base())
-				e.newFrame()
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opReturn
-			a := i.a()
-			if b := i.b(); b != 0 {
-				e.l.top = e.callInfo.stackIndex(a + b - 1)
-			}
-			if len(e.closure.prototype.prototypes) > 0 {
-				e.l.close(e.callInfo.base())
-			}
-			n := e.l.postCall(e.callInfo.stackIndex(a))
-			if !e.callInfo.isCallStatus(callStatusReentry) { // ci still the called one?
-				return nil, i // external invocation: return
-			}
-			e.callInfo = e.l.callInfo
-			if n {
-				e.l.top = e.callInfo.top
-			}
-			// TODO l.assert(e.callInfo.code[e.callInfo.savedPC-1].opCode() == opCall)
-			e.newFrame()
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opForLoop
-			a := i.a()
-			// Check if this is an integer loop or float loop
-			if iIndex, ok := e.frame[a+0].(int64); ok {
-				// Integer loop
-				iStep := e.frame[a+2].(int64)
-				iLimit := e.frame[a+1].(int64)
-				iIndex += iStep
-				if (0 < iStep && iIndex <= iLimit) || (iStep <= 0 && iLimit <= iIndex) {
-					e.callInfo.jump(i.sbx())
-					e.frame[a+0] = iIndex // update internal index...
-					e.frame[a+3] = iIndex // ... and external index
-				}
-			} else {
-				// Float loop
-				index, limit, step := e.frame[a+0].(float64), e.frame[a+1].(float64), e.frame[a+2].(float64)
-				if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
-					e.callInfo.jump(i.sbx())
-					e.frame[a+0] = index // update internal index...
-					e.frame[a+3] = index // ... and external index
-				}
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opForPrep
-			a := i.a()
-			// Try integer loop first: if init and step are integers, and limit can be integer
-			if iInit, initOk := e.frame[a+0].(int64); initOk {
-				if iStep, stepOk := e.frame[a+2].(int64); stepOk {
-					// Try to convert limit to integer
-					if iLimit, limitOk := forLimit(e.frame[a+1], iStep); limitOk {
-						// All values are integers - use integer loop
-						e.frame[a+0] = iInit - iStep
-						e.frame[a+1] = iLimit
-						// e.frame[a+2] is already iStep
-						e.callInfo.jump(i.sbx())
-						if e.hooked() {
-							e.hook()
-						}
-						i = e.callInfo.step()
-						return jumpTable[i.opCode()], i
-					}
-				}
-			}
-			// Fall back to float loop
-			if init, ok := e.l.toNumber(e.frame[a+0]); !ok {
-				e.l.runtimeError("'for' initial value must be a number")
-			} else if limit, ok := e.l.toNumber(e.frame[a+1]); !ok {
-				e.l.runtimeError("'for' limit must be a number")
-			} else if step, ok := e.l.toNumber(e.frame[a+2]); !ok {
-				e.l.runtimeError("'for' step must be a number")
-			} else {
-				e.frame[a+0], e.frame[a+1], e.frame[a+2] = init-step, limit, step
-				e.callInfo.jump(i.sbx())
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opTForCall
-			a := i.a()
-			callBase := a + 3
-			copy(e.frame[callBase:callBase+3], e.frame[a:a+3])
-			callBase += e.callInfo.base()
-			e.l.top = callBase + 3 // function + 2 args (state and index)
-			e.l.call(callBase, i.c(), true)
-			e.frame, e.l.top = e.callInfo.frame, e.callInfo.top
-			i = e.expectNext(opTForLoop)         // go to next instruction
-			if a := i.a(); e.frame[a+1] != nil { // continue loop?
-				e.frame[a] = e.frame[a+1] // save control variable
-				e.callInfo.jump(i.sbx())  // jump back
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opTForLoop:
-			if a := i.a(); e.frame[a+1] != nil { // continue loop?
-				e.frame[a] = e.frame[a+1] // save control variable
-				e.callInfo.jump(i.sbx())  // jump back
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opSetList:
-			a, n, c := i.a(), i.b(), i.c()
-			if n == 0 {
-				n = e.l.top - e.callInfo.stackIndex(a) - 1
-			}
-			if c == 0 {
-				c = e.expectNext(opExtraArg).ax()
-			}
-			h := e.frame[a].(*table)
-			start := (c - 1) * listItemsPerFlush
-			last := start + n
-			if last > len(h.array) {
-				h.extendArray(last)
-			}
-			copy(h.array[start:last], e.frame[a+1:a+1+n])
-			e.l.top = e.callInfo.top
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opClosure
-			a, p := i.a(), &e.closure.prototype.prototypes[i.bx()]
-			if ncl := cached(p, e.closure.upValues, e.callInfo.base()); ncl == nil { // no match?
-				e.frame[a] = e.l.newClosure(p, e.closure.upValues, e.callInfo.base()) // create a new one
-			} else {
-				e.frame[a] = ncl
-			}
-			clear(e.frame[a+1:])
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opVarArg
-			ci := e.callInfo
-			a, b := i.a(), i.b()-1
-			n := ci.base() - ci.function - e.closure.prototype.parameterCount - 1
-			if b < 0 {
-				b = n // get all var arguments
-				e.l.checkStack(n)
-				e.l.top = ci.base() + a + n
-				if ci.top < e.l.top {
-					ci.setTop(e.l.top)
-					ci.frame = e.l.stack[ci.base():ci.top]
-				}
-				e.frame = ci.frame
-			}
-			for j := 0; j < b; j++ {
-				if j < n {
-					e.frame[a+j] = e.l.stack[ci.base()-n+j]
-				} else {
-					e.frame[a+j] = nil
-				}
-			}
-			if e.hooked() {
-				e.hook()
-			}
-			i = e.callInfo.step()
-			return jumpTable[i.opCode()], i
-		},
-		func(e *engine, i instruction) (engineOp, instruction) { // opExtraArg
-			panic(fmt.Sprintf("unexpected opExtraArg instruction, '%s'", i.String()))
-		},
-	}
-}
-
-func (l *State) execute() { l.executeFunctionTable() }
-
-func (l *State) executeFunctionTable() {
-	ci := l.callInfo
-	closure, _ := l.stack[ci.function].(*luaClosure)
-	e := engine{callInfo: ci, frame: ci.frame, closure: closure, constants: closure.prototype.constants, l: l}
-	if l.hookMask&(MaskLine|MaskCount) != 0 {
-		if l.hookCount--; l.hookCount == 0 || l.hookMask&MaskLine != 0 {
-			l.traceExecution()
-			e.frame = e.callInfo.frame
-		}
-	}
-	i := e.callInfo.step()
-	f := jumpTable[i.opCode()]
-	for f, i = f(&e, i); f != nil; f, i = f(&e, i) {
-	}
-}
-
-func k(field int, constants []value, frame []value) value {
-	if 0 != field&bitRK { // OPT: Inline isConstant(field).
-		return constants[field & ^bitRK] // OPT: Inline constantIndex(field).
-	}
-	return frame[field]
-}
+func (l *State) execute() { l.executeSwitch() }
 
 func newFrame(l *State, ci *callInfo) (frame []value, closure *luaClosure, constants []value) {
 	// TODO l.assert(ci == l.callInfo)
@@ -1482,6 +741,7 @@ func expectNext(ci *callInfo, expected opCode) instruction {
 	return i
 }
 
+
 func (l *State) executeSwitch() {
 	ci := l.callInfo
 	frame, closure, constants := newFrame(l, ci)
@@ -1495,191 +755,438 @@ func (l *State) executeSwitch() {
 		switch i := ci.step(); i.opCode() {
 		case opMove:
 			frame[i.a()] = frame[i.b()]
+
+		case opLoadI:
+			frame[i.a()] = int64(i.sbx())
+
+		case opLoadF:
+			frame[i.a()] = float64(i.sbx())
+
 		case opLoadConstant:
 			frame[i.a()] = constants[i.bx()]
+
 		case opLoadConstantEx:
 			frame[i.a()] = constants[expectNext(ci, opExtraArg).ax()]
-		case opLoadBool:
-			frame[i.a()] = i.b() != 0
-			if i.c() != 0 {
-				ci.skip()
-			}
+
+		case opLoadFalse:
+			frame[i.a()] = false
+
+		case opLoadFalseSkip:
+			frame[i.a()] = false
+			ci.skip()
+
+		case opLoadTrue:
+			frame[i.a()] = true
+
 		case opLoadNil:
 			a, b := i.a(), i.b()
 			clear(frame[a : a+b+1])
+
 		case opGetUpValue:
 			frame[i.a()] = closure.upValue(i.b())
-		case opGetTableUp:
-			tmp := l.tableAt(closure.upValue(i.b()), k(i.c(), constants, frame))
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opGetTable:
-			tmp := l.tableAt(frame[i.b()], k(i.c(), constants, frame))
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opSetTableUp:
-			l.setTableAt(closure.upValue(i.a()), k(i.b(), constants, frame), k(i.c(), constants, frame))
-			frame = ci.frame
+
 		case opSetUpValue:
 			closure.setUpValue(i.b(), frame[i.a()])
-		case opSetTable:
-			l.setTableAt(frame[i.a()], k(i.b(), constants, frame), k(i.c(), constants, frame))
+
+		case opGetTableUp:
+			tmp := l.tableAt(closure.upValue(i.b()), constants[i.c()])
 			frame = ci.frame
+			frame[i.a()] = tmp
+
+		case opGetTable:
+			tmp := l.tableAt(frame[i.b()], frame[i.c()])
+			frame = ci.frame
+			frame[i.a()] = tmp
+
+		case opGetI:
+			tmp := l.tableAt(frame[i.b()], int64(i.c()))
+			frame = ci.frame
+			frame[i.a()] = tmp
+
+		case opGetField:
+			tmp := l.tableAt(frame[i.b()], constants[i.c()])
+			frame = ci.frame
+			frame[i.a()] = tmp
+
+		case opSetTableUp:
+			l.setTableAt(closure.upValue(i.a()), constants[i.b()], rkc(i, constants, frame))
+			frame = ci.frame
+
+		case opSetTable:
+			l.setTableAt(frame[i.a()], frame[i.b()], rkc(i, constants, frame))
+			frame = ci.frame
+
+		case opSetI:
+			l.setTableAt(frame[i.a()], int64(i.b()), rkc(i, constants, frame))
+			frame = ci.frame
+
+		case opSetField:
+			l.setTableAt(frame[i.a()], constants[i.b()], rkc(i, constants, frame))
+			frame = ci.frame
+
 		case opNewTable:
 			a := i.a()
-			if b, c := float8(i.b()), float8(i.c()); b != 0 || c != 0 {
-				frame[a] = newTableWithSize(intFromFloat8(b), intFromFloat8(c))
+			b := i.b() // log2(hash size) + 1
+			c := i.c() // array size
+			if i.k() != 0 {
+				c += expectNext(ci, opExtraArg).ax() * (maxArgC + 1)
+			} else {
+				ci.skip() // skip extra arg (which is 0)
+			}
+			hashSize := 0
+			if b > 0 {
+				hashSize = 1 << (b - 1)
+			}
+			if hashSize != 0 || c != 0 {
+				frame[a] = newTableWithSize(c, hashSize)
 			} else {
 				frame[a] = newTable()
 			}
-			clear(frame[a+1:])
+
 		case opSelf:
-			a, t := i.a(), frame[i.b()]
-			tmp := l.tableAt(t, k(i.c(), constants, frame))
+			a := i.a()
+			rb := frame[i.b()]
+			rc := rkc(i, constants, frame)
+			tmp := l.tableAt(rb, rc)
 			frame = ci.frame
-			frame[a+1], frame[a] = t, tmp
-		case opAdd:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+			frame[a+1] = rb
+			frame[a] = tmp
+
+		// --- Arithmetic with immediate (sC) ---
+		case opAddI:
+			b := frame[i.b()]
+			ic := int64(i.sC())
+			if ib, ok := b.(int64); ok {
+				frame[i.a()] = ib + ic
+				ci.skip()
+				break
+			}
+			if nb, ok := toFloat(b); ok {
+				frame[i.a()] = nb + float64(ic)
+				ci.skip()
+				break
+			}
+			// fall through to MMBINI
+
+		// --- Arithmetic with constant (K[C]) ---
+		case opAddK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib + ic
+				ci.skip()
+				break
+			}
 			if nb, nc, ok := numericValues(b, c); ok {
 				frame[i.a()] = nb + nc
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmAdd)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opSub:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+
+		case opSubK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib - ic
+				ci.skip()
+				break
+			}
 			if nb, nc, ok := numericValues(b, c); ok {
 				frame[i.a()] = nb - nc
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmSub)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opMul:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+
+		case opMulK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib * ic
+				ci.skip()
+				break
+			}
 			if nb, nc, ok := numericValues(b, c); ok {
 				frame[i.a()] = nb * nc
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmMul)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opDiv:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+
+		case opModK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				if ic == 0 {
+					l.runtimeError("attempt to perform 'n%0'")
+				}
+				frame[i.a()] = intMod(ib, ic)
+				ci.skip()
+				break
+			}
 			if nb, nc, ok := numericValues(b, c); ok {
-				frame[i.a()] = nb / nc
+				frame[i.a()] = luaMod(nb, nc)
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmDiv)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opMod:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if nb, nc, ok := numericValues(b, c); ok {
-				frame[i.a()] = math.Mod(nb, nc)
-				break
-			}
-			tmp := l.arith(b, c, tmMod)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opPow:
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+
+		case opPowK:
+			b, c := frame[i.b()], constants[i.c()]
 			if nb, nc, ok := numericValues(b, c); ok {
 				frame[i.a()] = math.Pow(nb, nc)
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmPow)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opIDiv: // Lua 5.3: integer division
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
+
+		case opDivK:
+			b, c := frame[i.b()], constants[i.c()]
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb / nc
+				ci.skip()
+				break
+			}
+
+		case opIDivK:
+			b, c := frame[i.b()], constants[i.c()]
 			if ib, ic, ok := integerValues(b, c); ok {
-				// Check for division by zero
 				if ic == 0 {
 					l.runtimeError("attempt to divide by zero")
 				}
-				// Check for overflow: minint // -1 would overflow
-				if ib != math.MinInt64 || ic != -1 {
-					frame[i.a()] = intIDiv(ib, ic)
-					break
-				}
-				// Fall through to float division
+				frame[i.a()] = intIDiv(ib, ic)
+				ci.skip()
+				break
 			}
 			if nb, nc, ok := numericValues(b, c); ok {
 				frame[i.a()] = math.Floor(nb / nc)
+				ci.skip()
 				break
 			}
-			tmp := l.arith(b, c, tmIDiv)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opBAnd: // Lua 5.3: bitwise AND
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
-				frame[i.a()] = ib & ic
+
+		case opBAndK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib & ic
+					ci.skip()
+					break
+				}
+			}
+
+		case opBOrK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib | ic
+					ci.skip()
+					break
+				}
+			}
+
+		case opBXorK:
+			b, c := frame[i.b()], constants[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib ^ ic
+					ci.skip()
+					break
+				}
+			}
+
+		// --- Shift with immediate ---
+		case opShrI:
+			// R[A] := R[B] >> sC
+			b := frame[i.b()]
+			if ib, ok := toInteger(b); ok {
+				frame[i.a()] = intShiftLeft(ib, -int64(i.sC()))
+				ci.skip()
 				break
 			}
-			tmp := l.bitwiseArith(b, c, tmBAnd)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opBOr: // Lua 5.3: bitwise OR
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
-				frame[i.a()] = ib | ic
+
+		case opShlI:
+			// R[A] := sC << R[B] (sC is value, R[B] is shift amount)
+			b := frame[i.b()]
+			if ib, ok := toInteger(b); ok {
+				frame[i.a()] = intShiftLeft(int64(i.sC()), ib)
+				ci.skip()
 				break
 			}
-			tmp := l.bitwiseArith(b, c, tmBOr)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opBXor: // Lua 5.3: bitwise XOR
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
-				frame[i.a()] = ib ^ ic
+
+		// --- Register-register arithmetic ---
+		case opAdd:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib + ic
+				ci.skip()
 				break
 			}
-			tmp := l.bitwiseArith(b, c, tmBXor)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opShl: // Lua 5.3: shift left
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
-				frame[i.a()] = intShiftLeft(ib, ic)
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb + nc
+				ci.skip()
 				break
 			}
-			tmp := l.bitwiseArith(b, c, tmShl)
-			frame = ci.frame
-			frame[i.a()] = tmp
-		case opShr: // Lua 5.3: shift right
-			b := k(i.b(), constants, frame)
-			c := k(i.c(), constants, frame)
-			if ib, ic, ok := l.coerceToIntegers(b, c); ok {
-				frame[i.a()] = intShiftLeft(ib, -ic)
+
+		case opSub:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib - ic
+				ci.skip()
 				break
 			}
-			tmp := l.bitwiseArith(b, c, tmShr)
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb - nc
+				ci.skip()
+				break
+			}
+
+		case opMul:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				frame[i.a()] = ib * ic
+				ci.skip()
+				break
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb * nc
+				ci.skip()
+				break
+			}
+
+		case opMod:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				if ic == 0 {
+					l.runtimeError("attempt to perform 'n%0'")
+				}
+				frame[i.a()] = intMod(ib, ic)
+				ci.skip()
+				break
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = luaMod(nb, nc)
+				ci.skip()
+				break
+			}
+
+		case opPow:
+			b, c := frame[i.b()], frame[i.c()]
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = math.Pow(nb, nc)
+				ci.skip()
+				break
+			}
+
+		case opDiv:
+			b, c := frame[i.b()], frame[i.c()]
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = nb / nc
+				ci.skip()
+				break
+			}
+
+		case opIDiv:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ic, ok := integerValues(b, c); ok {
+				if ic == 0 {
+					l.runtimeError("attempt to divide by zero")
+				}
+				frame[i.a()] = intIDiv(ib, ic)
+				ci.skip()
+				break
+			}
+			if nb, nc, ok := numericValues(b, c); ok {
+				frame[i.a()] = math.Floor(nb / nc)
+				ci.skip()
+				break
+			}
+
+		case opBAnd:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib & ic
+					ci.skip()
+					break
+				}
+			}
+
+		case opBOr:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib | ic
+					ci.skip()
+					break
+				}
+			}
+
+		case opBXor:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = ib ^ ic
+					ci.skip()
+					break
+				}
+			}
+
+		case opShl:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = intShiftLeft(ib, ic)
+					ci.skip()
+					break
+				}
+			}
+
+		case opShr:
+			b, c := frame[i.b()], frame[i.c()]
+			if ib, ok := toInteger(b); ok {
+				if ic, ok := toInteger(c); ok {
+					frame[i.a()] = intShiftLeft(ib, -ic)
+					ci.skip()
+					break
+				}
+			}
+
+		// --- MMBIN metamethod fallbacks ---
+		case opMMBin:
+			pi := ci.code[ci.savedPC-2]
+			ra, rb := frame[i.a()], frame[i.b()]
+			event := tm(i.c())
+			result := l.arithOrBitwise(ra, rb, event)
 			frame = ci.frame
-			frame[i.a()] = tmp
+			frame[pi.a()] = result
+
+		case opMMBinI:
+			pi := ci.code[ci.savedPC-2]
+			ra := frame[i.a()]
+			imm := int64(i.sB())
+			event := tm(i.c())
+			if i.k() != 0 {
+				result := l.arithOrBitwise(imm, ra, event)
+				frame = ci.frame
+				frame[pi.a()] = result
+			} else {
+				result := l.arithOrBitwise(ra, imm, event)
+				frame = ci.frame
+				frame[pi.a()] = result
+			}
+
+		case opMMBinK:
+			pi := ci.code[ci.savedPC-2]
+			ra := frame[i.a()]
+			kb := constants[i.b()]
+			event := tm(i.c())
+			if i.k() != 0 {
+				result := l.arithOrBitwise(kb, ra, event)
+				frame = ci.frame
+				frame[pi.a()] = result
+			} else {
+				result := l.arithOrBitwise(ra, kb, event)
+				frame = ci.frame
+				frame[pi.a()] = result
+			}
+
+		// --- Unary operations ---
 		case opUnaryMinus:
 			b := frame[i.b()]
-			// Lua 5.3: preserve integer type unless overflow
 			if ib, ok := b.(int64); ok {
-				if ib == math.MinInt64 {
-					// -minint overflows, return float
-					frame[i.a()] = -float64(ib)
-				} else {
-					frame[i.a()] = -ib
-				}
+				frame[i.a()] = -ib
 			} else if nb, ok := toFloat(b); ok {
 				frame[i.a()] = -nb
 			} else {
@@ -1687,255 +1194,423 @@ func (l *State) executeSwitch() {
 				frame = ci.frame
 				frame[i.a()] = tmp
 			}
-		case opBNot: // Lua 5.3: bitwise NOT
+
+		case opBNot:
 			b := frame[i.b()]
-			if ib, ok := l.toIntegerString(b); ok {
+			if ib, ok := toInteger(b); ok {
 				frame[i.a()] = ^ib
-				break
+			} else {
+				tmp := l.bitwiseArith(b, b, tmBNot)
+				frame = ci.frame
+				frame[i.a()] = tmp
 			}
-			tmp := l.bitwiseArith(b, b, tmBNot)
-			frame = ci.frame
-			frame[i.a()] = tmp
+
 		case opNot:
 			frame[i.a()] = isFalse(frame[i.b()])
+
 		case opLength:
 			tmp := l.objectLength(frame[i.b()])
 			frame = ci.frame
 			frame[i.a()] = tmp
+
+		// --- Concat (5.4: R[A]..R[A+B-1], B values, result in R[A]) ---
 		case opConcat:
-			a, b, c := i.a(), i.b(), i.c()
-			l.top = ci.stackIndex(c + 1) // mark the end of concat operands
-			l.concat(c - b + 1)
+			a := i.a()
+			n := i.b()
+			l.top = ci.stackIndex(a + n)
+			l.concat(n)
 			frame = ci.frame
-			frame[a] = frame[b]
-			if a >= b { // limit of live values
-				clear(frame[a+1:])
-			} else {
-				clear(frame[b:])
+			frame[a] = l.stack[l.top-1]
+			l.top = ci.top
+
+		// --- Close / TBC ---
+		case opClose:
+			l.closeYieldable(ci.stackIndex(i.a()))
+
+		case opTBC:
+			ra := ci.stackIndex(i.a())
+			v := l.stack[ra]
+			// false/nil don't need closing
+			if v != nil && v != false {
+				// Check for __close metamethod
+				if l.tagMethodByObject(v, tmClose) == nil {
+					// Try to get the variable name for the error message
+					p := l.stack[ci.function].(*luaClosure).prototype
+					vname := "?"
+					if name, found := p.localName(i.a()+1, pc(ci.savedPC-1)); found {
+						vname = name
+					}
+					l.runtimeError(fmt.Sprintf("variable '%s' got a non-closable value", vname))
+				}
+				l.newTBCUpValue(ra)
 			}
+
+		// --- Jump (5.4: isJ format, sJ signed offset) ---
 		case opJump:
-			if a := i.a(); a > 0 {
-				l.close(ci.stackIndex(a - 1))
-			}
-			ci.jump(i.sbx())
+			ci.jump(i.sJ())
+
+		// --- Comparisons (5.4: k-bit for expected condition, followed by JMP) ---
 		case opEqual:
-			test := i.a() != 0
-			if l.equalObjects(k(i.b(), constants, frame), k(i.c(), constants, frame)) == test {
-				i := ci.step()
-				if a := i.a(); a > 0 {
-					l.close(ci.stackIndex(a - 1))
-				}
-				ci.jump(i.sbx())
-			} else {
-				ci.skip()
-			}
+			cond := l.equalObjects(frame[i.a()], frame[i.b()])
 			frame = ci.frame
+			doCondJump(ci, cond, i.k() != 0)
+
 		case opLessThan:
-			test := i.a() != 0
-			if l.lessThan(k(i.b(), constants, frame), k(i.c(), constants, frame)) == test {
-				i := ci.step()
-				if a := i.a(); a > 0 {
-					l.close(ci.stackIndex(a - 1))
-				}
-				ci.jump(i.sbx())
-			} else {
-				ci.skip()
-			}
+			cond := l.lessThan(frame[i.a()], frame[i.b()])
 			frame = ci.frame
+			doCondJump(ci, cond, i.k() != 0)
+
 		case opLessOrEqual:
-			test := i.a() != 0
-			if l.lessOrEqual(k(i.b(), constants, frame), k(i.c(), constants, frame)) == test {
-				i := ci.step()
-				if a := i.a(); a > 0 {
-					l.close(ci.stackIndex(a - 1))
-				}
-				ci.jump(i.sbx())
-			} else {
-				ci.skip()
-			}
+			cond := l.lessOrEqual(frame[i.a()], frame[i.b()])
 			frame = ci.frame
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opEqualK:
+			cond := l.equalObjects(frame[i.a()], constants[i.b()])
+			frame = ci.frame
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opEqualI:
+			ra := frame[i.a()]
+			imm := int64(i.sB())
+			var cond bool
+			switch v := ra.(type) {
+			case int64:
+				cond = v == imm
+			case float64:
+				cond = v == float64(imm)
+			}
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opLessThanI:
+			ra := frame[i.a()]
+			imm := i.sB()
+			var cond bool
+			switch v := ra.(type) {
+			case int64:
+				cond = v < int64(imm)
+			case float64:
+				cond = v < float64(imm)
+			default:
+				cond = l.callOrderImmediate(ra, imm, false, i.c() != 0, tmLT)
+				frame = ci.frame
+			}
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opLessOrEqualI:
+			ra := frame[i.a()]
+			imm := i.sB()
+			var cond bool
+			switch v := ra.(type) {
+			case int64:
+				cond = v <= int64(imm)
+			case float64:
+				cond = v <= float64(imm)
+			default:
+				cond = l.callOrderImmediate(ra, imm, false, i.c() != 0, tmLE)
+				frame = ci.frame
+			}
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opGreaterThanI:
+			ra := frame[i.a()]
+			imm := i.sB()
+			var cond bool
+			switch v := ra.(type) {
+			case int64:
+				cond = v > int64(imm)
+			case float64:
+				cond = v > float64(imm)
+			default:
+				cond = l.callOrderImmediate(ra, imm, true, i.c() != 0, tmLT)
+				frame = ci.frame
+			}
+			doCondJump(ci, cond, i.k() != 0)
+
+		case opGreaterOrEqualI:
+			ra := frame[i.a()]
+			imm := i.sB()
+			var cond bool
+			switch v := ra.(type) {
+			case int64:
+				cond = v >= int64(imm)
+			case float64:
+				cond = v >= float64(imm)
+			default:
+				cond = l.callOrderImmediate(ra, imm, true, i.c() != 0, tmLE)
+				frame = ci.frame
+			}
+			doCondJump(ci, cond, i.k() != 0)
+
+		// --- Test / TestSet (5.4: k-bit for condition) ---
 		case opTest:
-			test := i.c() == 0
-			if isFalse(frame[i.a()]) == test {
-				i := ci.step()
-				if a := i.a(); a > 0 {
-					l.close(ci.stackIndex(a - 1))
-				}
-				ci.jump(i.sbx())
-			} else {
-				ci.skip()
-			}
+			cond := !isFalse(frame[i.a()])
+			doCondJump(ci, cond, i.k() != 0)
+
 		case opTestSet:
-			b := frame[i.b()]
-			test := i.c() == 0
-			if isFalse(b) == test {
-				frame[i.a()] = b
-				i := ci.step()
-				if a := i.a(); a > 0 {
-					l.close(ci.stackIndex(a - 1))
-				}
-				ci.jump(i.sbx())
+			rb := frame[i.b()]
+			cond := !isFalse(rb)
+			if cond == (i.k() != 0) {
+				frame[i.a()] = rb
+				ji := ci.step()
+				ci.jump(ji.sJ())
 			} else {
 				ci.skip()
 			}
+
+		// --- Call ---
 		case opCall:
 			a, b, c := i.a(), i.b(), i.c()
 			if b != 0 {
 				l.top = ci.stackIndex(a + b)
-			} // else previous instruction set top
-			if n := c - 1; l.preCall(ci.stackIndex(a), n) { // go function
+			}
+			if n := c - 1; l.preCall(ci.stackIndex(a), n) {
 				if n >= 0 {
-					l.top = ci.top // adjust results
+					l.top = ci.top
 				}
 				frame = ci.frame
-			} else { // lua function
+			} else {
 				ci = l.callInfo
 				ci.setCallStatus(callStatusReentry)
 				frame, closure, constants = newFrame(l, ci)
 			}
+
 		case opTailCall:
 			a, b := i.a(), i.b()
 			if b != 0 {
 				l.top = ci.stackIndex(a + b)
-			} // else previous instruction set top
-			// TODO l.assert(i.c()-1 == MultipleReturns)
-			if l.preCall(ci.stackIndex(a), MultipleReturns) { // go function
+			}
+			if i.k() != 0 {
+				l.close(ci.base())
+			}
+			if l.preCall(ci.stackIndex(a), MultipleReturns) {
 				frame = ci.frame
 			} else {
-				// tail call: put called frame (n) in place of caller one (o)
-				nci := l.callInfo                      // called frame
-				oci := nci.previous                    // caller frame
-				nfn, ofn := nci.function, oci.function // called & caller function
-				// last stack slot filled by 'precall'
+				nci := l.callInfo
+				oci := nci.previous
+				nfn, ofn := nci.function, oci.function
 				lim := nci.base() + l.stack[nfn].(*luaClosure).prototype.parameterCount
-				if len(closure.prototype.prototypes) > 0 { // close all upvalues from previous call
+				if len(closure.prototype.prototypes) > 0 {
 					l.close(oci.base())
 				}
-				// move new frame into old one
-				for i := 0; nfn+i < lim; i++ {
-					l.stack[ofn+i] = l.stack[nfn+i]
+				for j := 0; nfn+j < lim; j++ {
+					l.stack[ofn+j] = l.stack[nfn+j]
 				}
-				base := ofn + (nci.base() - nfn) // correct base
-				oci.setTop(ofn + (l.top - nfn))  // correct top
+				base := ofn + (nci.base() - nfn)
+				oci.setTop(ofn + (l.top - nfn))
 				oci.frame = l.stack[base:oci.top]
-				oci.savedPC, oci.code = nci.savedPC, nci.code // correct code (savedPC indexes nci->code)
-				oci.setCallStatus(callStatusTail)             // function was tail called
+				oci.savedPC, oci.code = nci.savedPC, nci.code
+				oci.setCallStatus(callStatusTail)
 				l.top, l.callInfo, ci = oci.top, oci, oci
-				// TODO l.assert(l.top == oci.base()+l.stack[ofn].(*luaClosure).prototype.maxStackSize)
-				// TODO l.assert(&oci.frame[0] == &l.stack[oci.base()] && len(oci.frame) == oci.top-oci.base())
 				frame, closure, constants = newFrame(l, ci)
 			}
+
 		case opReturn:
 			a := i.a()
-			if b := i.b(); b != 0 {
+			b := i.b()
+			if b != 0 {
 				l.top = ci.stackIndex(a + b - 1)
 			}
-			if len(closure.prototype.prototypes) > 0 {
+			if i.k() != 0 {
+				ci.savedTop = l.top
+				l.closeYieldable(ci.base())
+			} else if len(closure.prototype.prototypes) > 0 {
 				l.close(ci.base())
 			}
 			n := l.postCall(ci.stackIndex(a))
-			if !ci.isCallStatus(callStatusReentry) { // ci still the called one?
-				return // external invocation: return
+			if !ci.isCallStatus(callStatusReentry) {
+				return
 			}
 			ci = l.callInfo
 			if n {
 				l.top = ci.top
 			}
-			// TODO l.assert(ci.code[ci.savedPC-1].opCode() == opCall)
 			frame, closure, constants = newFrame(l, ci)
+
+		case opReturn0:
+			if i.k() != 0 {
+				l.closeYieldable(ci.base())
+			} else if len(closure.prototype.prototypes) > 0 {
+				l.close(ci.base())
+			}
+			l.top = ci.stackIndex(i.a())
+			n := l.postCall(ci.stackIndex(i.a()))
+			if !ci.isCallStatus(callStatusReentry) {
+				return
+			}
+			ci = l.callInfo
+			if n {
+				l.top = ci.top
+			}
+			frame, closure, constants = newFrame(l, ci)
+
+		case opReturn1:
+			a := i.a()
+			if i.k() != 0 {
+				l.closeYieldable(ci.base())
+			} else if len(closure.prototype.prototypes) > 0 {
+				l.close(ci.base())
+			}
+			l.top = ci.stackIndex(a + 1)
+			n := l.postCall(ci.stackIndex(a))
+			if !ci.isCallStatus(callStatusReentry) {
+				return
+			}
+			ci = l.callInfo
+			if n {
+				l.top = ci.top
+			}
+			frame, closure, constants = newFrame(l, ci)
+
+		// --- For loops (5.4: Bx format, counter-based for integers) ---
 		case opForLoop:
 			a := i.a()
-			// Check if this is an integer loop or float loop
-			if iIndex, ok := frame[a+0].(int64); ok {
-				// Integer loop
-				iStep := frame[a+2].(int64)
-				iLimit := frame[a+1].(int64)
-				iIndex += iStep
-				if (0 < iStep && iIndex <= iLimit) || (iStep <= 0 && iLimit <= iIndex) {
-					ci.jump(i.sbx())
-					frame[a+0] = iIndex // update internal index...
-					frame[a+3] = iIndex // ... and external index
+			if _, ok := frame[a+2].(int64); ok {
+				// Integer loop: ra+1 is counter (unsigned)
+				count := uint64(frame[a+1].(int64))
+				if count > 0 {
+					step := frame[a+2].(int64)
+					idx := frame[a].(int64)
+					frame[a+1] = int64(count - 1)
+					idx = int64(uint64(idx) + uint64(step))
+					frame[a] = idx
+					frame[a+3] = idx
+					ci.jump(-i.bx())
 				}
 			} else {
 				// Float loop
-				index, limit, step := frame[a+0].(float64), frame[a+1].(float64), frame[a+2].(float64)
-				if index += step; (0 < step && index <= limit) || (step <= 0 && limit <= index) {
-					ci.jump(i.sbx())
-					frame[a+0] = index // update internal index...
-					frame[a+3] = index // ... and external index
+				step := frame[a+2].(float64)
+				limit := frame[a+1].(float64)
+				idx := frame[a].(float64)
+				idx += step
+				if (step > 0 && idx <= limit) || (step <= 0 && limit <= idx) {
+					frame[a] = idx
+					frame[a+3] = idx
+					ci.jump(-i.bx())
 				}
 			}
+
 		case opForPrep:
 			a := i.a()
-			// Try integer loop first: if init and step are integers, and limit can be integer
-			if iInit, initOk := frame[a+0].(int64); initOk {
+			if iInit, initOk := frame[a].(int64); initOk {
 				if iStep, stepOk := frame[a+2].(int64); stepOk {
-					// Try to convert limit to integer
-					if iLimit, limitOk := forLimit(frame[a+1], iStep); limitOk {
-						// All values are integers - use integer loop
-						frame[a+0] = iInit - iStep
-						frame[a+1] = iLimit
-						// frame[a+2] is already iStep
-						ci.jump(i.sbx())
+					if iStep == 0 {
+						l.runtimeError("'for' step is zero")
+					}
+					frame[a+3] = iInit // control variable
+					iLimit, shouldSkip := l.forLimit54(frame[a+1], iInit, iStep)
+					if shouldSkip {
+						ci.jump(i.bx() + 1) // skip loop body + FORLOOP
 						break
 					}
+					// Compute iteration counter
+					var count uint64
+					if iStep > 0 {
+						count = uint64(iLimit) - uint64(iInit)
+						if iStep != 1 {
+							count /= uint64(iStep)
+						}
+					} else {
+						count = uint64(iInit) - uint64(iLimit)
+						count /= uint64(-(iStep+1)) + 1
+					}
+					frame[a+1] = int64(count) // store counter in place of limit
+					// ra stays as init (unchanged)
+					break
 				}
 			}
-			// Fall back to float loop
-			if init, ok := l.toNumber(frame[a+0]); !ok {
-				l.runtimeError("'for' initial value must be a number")
-			} else if limit, ok := l.toNumber(frame[a+1]); !ok {
-				l.runtimeError("'for' limit must be a number")
-			} else if step, ok := l.toNumber(frame[a+2]); !ok {
-				l.runtimeError("'for' step must be a number")
-			} else {
-				frame[a+0], frame[a+1], frame[a+2] = init-step, limit, step
-				ci.jump(i.sbx())
+			// Float loop
+			init, ok1 := l.toNumber(frame[a])
+			limit, ok2 := l.toNumber(frame[a+1])
+			step, ok3 := l.toNumber(frame[a+2])
+			if !ok2 {
+				l.runtimeError(fmt.Sprintf("bad 'for' limit (number expected, got %s)", l.valueTypeName(frame[a+1])))
 			}
+			if !ok3 {
+				l.runtimeError(fmt.Sprintf("bad 'for' step (number expected, got %s)", l.valueTypeName(frame[a+2])))
+			}
+			if !ok1 {
+				l.runtimeError(fmt.Sprintf("bad 'for' initial value (number expected, got %s)", l.valueTypeName(frame[a])))
+			}
+			if step == 0 {
+				l.runtimeError("'for' step is zero")
+			}
+			if (step > 0 && limit < init) || (step <= 0 && init < limit) {
+				ci.jump(i.bx() + 1) // skip loop
+				break
+			}
+			frame[a] = init
+			frame[a+1] = limit
+			frame[a+2] = step
+			frame[a+3] = init // control variable
+
+		case opTForPrep:
+			// Lua 5.4: mark R[A+3] as to-be-closed variable
+			a := i.a()
+			tbcIdx := ci.stackIndex(a + 3)
+			v := l.stack[tbcIdx]
+			if v != nil && v != false {
+				if l.tagMethodByObject(v, tmClose) == nil {
+					l.runtimeError("variable is not closable")
+				}
+				l.newTBCUpValue(tbcIdx)
+			}
+			// Jump forward to TFORCALL/TFORLOOP
+			ci.jump(i.bx())
+
 		case opTForCall:
 			a := i.a()
-			callBase := a + 3
+			callBase := a + 4 // 5.4: results start at ra+4 (ra+3 is to-be-closed)
 			copy(frame[callBase:callBase+3], frame[a:a+3])
 			callBase += ci.base()
-			l.top = callBase + 3 // function + 2 args (state and index)
+			l.top = callBase + 3
 			l.call(callBase, i.c(), true)
 			frame, l.top = ci.frame, ci.top
-			i = expectNext(ci, opTForLoop) // go to next instruction
+			i = expectNext(ci, opTForLoop)
 			fallthrough
+
 		case opTForLoop:
-			if a := i.a(); frame[a+1] != nil { // continue loop?
-				frame[a] = frame[a+1] // save control variable
-				ci.jump(i.sbx())      // jump back
+			// A = base+2 (control variable); first user var at A+2 = base+4
+			a := i.a()
+			if frame[a+2] != nil { // first user variable at ra+2
+				frame[a] = frame[a+2] // update control variable
+				ci.jump(-i.bx())      // jump back
 			}
+
 		case opSetList:
-			a, n, c := i.a(), i.b(), i.c()
+			a, n := i.a(), i.b()
+			c := i.c()
 			if n == 0 {
 				n = l.top - ci.stackIndex(a) - 1
+			} else {
+				l.top = ci.top
 			}
-			if c == 0 {
-				c = expectNext(ci, opExtraArg).ax()
+			if i.k() != 0 {
+				c += expectNext(ci, opExtraArg).ax() * (maxArgC + 1)
 			}
 			h := frame[a].(*table)
-			start := (c - 1) * listItemsPerFlush
-			last := start + n
+			last := c + n
 			if last > len(h.array) {
 				h.extendArray(last)
 			}
-			copy(h.array[start:last], frame[a+1:a+1+n])
+			copy(h.array[c:last], frame[a+1:a+1+n])
 			l.top = ci.top
+
 		case opClosure:
 			a, p := i.a(), &closure.prototype.prototypes[i.bx()]
-			if ncl := cached(p, closure.upValues, ci.base()); ncl == nil { // no match?
-				frame[a] = l.newClosure(p, closure.upValues, ci.base()) // create a new one
+			if ncl := cached(p, closure.upValues, ci.base()); ncl == nil {
+				frame[a] = l.newClosure(p, closure.upValues, ci.base())
 			} else {
 				frame[a] = ncl
 			}
 			clear(frame[a+1:])
+
 		case opVarArg:
-			a, b := i.a(), i.b()-1
+			a := i.a()
+			b := i.c() - 1 // 5.4 uses C field, not B
 			n := ci.base() - ci.function - closure.prototype.parameterCount - 1
 			if b < 0 {
-				b = n // get all var arguments
+				b = n
 				l.checkStack(n)
 				l.top = ci.base() + a + n
 				if ci.top < l.top {
@@ -1951,8 +1626,31 @@ func (l *State) executeSwitch() {
 					frame[a+j] = nil
 				}
 			}
+
+		case opVarArgPrep:
+			// In Go, adjustVarArgs is already called in preCall.
+			// Handle hook setup for vararg functions (matches C Lua OP_VARARGPREP).
+			if l.hookMask != 0 {
+				if l.hookMask&MaskCall != 0 {
+					l.callHook(ci)
+				}
+				l.oldPC = 1 // next opcode will be seen as a "new" line
+			}
+
 		case opExtraArg:
 			panic(fmt.Sprintf("unexpected opExtraArg instruction, '%s'", i.String()))
 		}
+	}
+}
+
+// doCondJump implements the 5.4 comparison jump pattern.
+// If cond matches expected (k-bit), execute the next instruction as JMP.
+// Otherwise, skip the next instruction (JMP).
+func doCondJump(ci *callInfo, cond bool, expected bool) {
+	if cond == expected {
+		ji := ci.step()
+		ci.jump(ji.sJ())
+	} else {
+		ci.skip()
 	}
 }

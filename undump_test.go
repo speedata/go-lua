@@ -11,31 +11,31 @@ import (
 )
 
 func TestAllHeaderNoFun(t *testing.T) {
-	expectErrorFromUndump(errTruncated, header, t)
+	expectErrorFromUndump(errTruncated, header54, t)
 }
 
 func TestWrongEndian(t *testing.T) {
 	// In Lua 5.3, endianness is checked via TestInt (0x5678)
-	h := header
+	h := header54
 	// Swap byte order of TestInt
 	h.TestInt = int64(0x7856000000000000)
 	expectErrorFromUndump(errIncompatible, h, t)
 }
 
 func TestWrongVersion(t *testing.T) {
-	h := header
+	h := header54
 	h.Version++
 	expectErrorFromUndump(errVersionMismatch, h, t)
 }
 
 func TestWrongNumberSize(t *testing.T) {
-	h := header
+	h := header54
 	h.NumberSize /= 2
 	expectErrorFromUndump(errIncompatible, h, t)
 }
 
 func TestCorruptData(t *testing.T) {
-	h := header
+	h := header54
 	h.Data[3]++
 	expectErrorFromUndump(errCorrupted, h, t)
 }
@@ -68,7 +68,7 @@ func TestUndump(t *testing.T) {
 		t.Fatal("prototype was nil")
 	}
 	validate("@lua-tests/checktable.lua", p.source, "as source file name", t)
-	validate(23, len(p.code), "instructions", t)
+	validate(24, len(p.code), "instructions", t)
 	validate(8, len(p.constants), "constants", t)
 	validate(4, len(p.prototypes), "prototypes", t)
 	validate(1, len(p.upValues), "upvalues", t)

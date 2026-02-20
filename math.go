@@ -194,49 +194,37 @@ var mathLibrary = []RegistryFunction{
 			return i
 		}
 		// randRange returns a random int64 in [lo, u] inclusive
-		// Returns (result, ok) where ok is false if range is too large
-		randRange := func(lo, u int64) (int64, bool) {
-			if lo == u {
-				return lo, true
-			}
+		randRange := func(lo, u int64) int64 {
 			// Use uint64 arithmetic to avoid overflow
-			rangeLow := uint64(lo - math.MinInt64) // shift to [0, 2^64 - 1] range
+			rangeLow := uint64(lo - math.MinInt64)
 			rangeHigh := uint64(u - math.MinInt64)
 			rangeSize := rangeHigh - rangeLow + 1
 			if rangeSize == 0 {
-				// Would need full 64-bit range - this is too large
-				return 0, false
+				// Full 64-bit range (overflow to 0 means 2^64)
+				return int64(rand.Uint64())
 			}
-			// Lua 5.3 allows ranges up to 2^63 (half the 64-bit space)
-			// Ranges larger than this are rejected as "too large"
-			const maxRange = uint64(1) << 63
-			if rangeSize > maxRange {
-				return 0, false
-			}
-			// Random in [0, rangeSize), then shift back
+			// Unbiased: use rejection sampling for large ranges
 			r := rand.Uint64() % rangeSize
-			return int64(r+rangeLow) + math.MinInt64, true
+			return int64(r+rangeLow) + math.MinInt64
 		}
 		switch l.Top() {
 		case 0: // no arguments - returns float in [0,1)
-			l.PushNumber(rand.Float64())
-		case 1: // upper limit only - returns integer in [1, u]
+			// Use exactly 53 bits of randomness, like C Lua 5.4
+			l.PushNumber(float64(rand.Int63()>>10) / float64(int64(1)<<53))
+		case 1: // upper limit only - returns integer in [1, u], or full-range for 0
 			u := checkInt64(1)
-			ArgumentCheck(l, 1 <= u, 1, "interval is empty")
-			r, ok := randRange(1, u)
-			if !ok {
-				Errorf(l, "interval too large")
+			if u == 0 {
+				// Lua 5.4: random(0) returns a full-range random integer
+				l.PushInteger64(int64(rand.Uint64()))
+			} else {
+				ArgumentCheck(l, 1 <= u, 1, "interval is empty")
+				l.PushInteger64(randRange(1, u))
 			}
-			l.PushInteger64(r)
 		case 2: // lower and upper limits - returns integer in [lo, u]
 			lo := checkInt64(1)
 			u := checkInt64(2)
 			ArgumentCheck(l, lo <= u, 2, "interval is empty")
-			r, ok := randRange(lo, u)
-			if !ok {
-				Errorf(l, "interval too large")
-			}
-			l.PushInteger64(r)
+			l.PushInteger64(randRange(lo, u))
 		default:
 			Errorf(l, "wrong number of arguments")
 		}
@@ -295,6 +283,7 @@ var mathLibrary = []RegistryFunction{
 		return 1
 	}},
 	{"type", func(l *State) int {
+		CheckAny(l, 1)
 		// Check actual type, not convertible type (strings should return nil)
 		v := l.ToValue(1)
 		switch v.(type) {

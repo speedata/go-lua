@@ -1,6 +1,49 @@
 package lua
 
 var coroutineLibrary = []RegistryFunction{
+	{"close", func(l *State) int {
+		co := CheckThread(l, 1)
+		// Cannot close a running coroutine
+		if co == l {
+			Errorf(l, "cannot close a running coroutine")
+		}
+		// Cannot close a normal coroutine (one that has resumed another)
+		if co.status == threadStatusOK && co.callInfo != &co.baseCallInfo {
+			Errorf(l, "cannot close a normal coroutine")
+		}
+		// Like C Lua's luaE_resetthread: reset coroutine state and close TBC vars
+		hadError := co.hasError
+		co.hasError = false
+		// Reset call info to base (like C Lua)
+		co.callInfo = &co.baseCallInfo
+		co.errorFunction = 0 // clear any xpcall error handler
+		co.status = threadStatusOK // temporarily OK so __close handlers can run
+		// Close TBC variables in protected mode with error chaining
+		closeErrVal := co.closeTBCProtected(0, nil)
+		// Mark it dead
+		co.status = threadStatusDead
+		if closeErrVal != nil {
+			// __close handler threw an error
+			l.PushBoolean(false)
+			l.push(closeErrVal)
+			return 2
+		}
+		if hadError {
+			// Coroutine died with an error — return false + error value
+			l.PushBoolean(false)
+			if co.Top() > 0 {
+				XMove(co, l, 1)
+			} else {
+				l.PushNil()
+			}
+			co.top = 1
+			return 2
+		}
+		// Clean close
+		co.top = 1
+		l.PushBoolean(true)
+		return 1
+	}},
 	{"create", func(l *State) int {
 		CheckType(l, 1, TypeFunction)
 		co := l.NewThread()
@@ -49,7 +92,13 @@ var coroutineLibrary = []RegistryFunction{
 		return 2
 	}},
 	{"isyieldable", func(l *State) int {
-		l.PushBoolean(l.nonYieldableCallCount == 0)
+		// Lua 5.4: optional argument (coroutine to check)
+		if l.Top() >= 1 && l.TypeOf(1) == TypeThread {
+			co := l.ToThread(1)
+			l.PushBoolean(co.nonYieldableCallCount == 0)
+		} else {
+			l.PushBoolean(l.nonYieldableCallCount == 0)
+		}
 		return 1
 	}},
 }
@@ -110,6 +159,28 @@ func coroutineWrapHelper(l *State) int {
 
 	err := co.Resume(l, nArgs)
 	if err != nil {
+		// Close dead coroutine's TBC variables (like C Lua's lua_closethread)
+		if co.status == threadStatusDead {
+			// Save error value before reset
+			var errObj value
+			if co.top > 1 {
+				errObj = co.stack[co.top-1]
+			}
+			// Reset coroutine state (like luaE_resetthread)
+			co.callInfo = &co.baseCallInfo
+			co.errorFunction = 0
+			co.status = threadStatusOK // temporarily so __close handlers can run
+			co.closeUpValues(1)
+			closeErr := co.closeTBCProtected(1, errObj)
+			// Set error on co's stack at position 1
+			if closeErr != nil {
+				co.stack[1] = closeErr
+			} else {
+				co.stack[1] = errObj
+			}
+			co.top = 2
+			co.status = threadStatusDead
+		}
 		// Propagate error
 		if co.Top() > 0 {
 			co.PushValue(-1)

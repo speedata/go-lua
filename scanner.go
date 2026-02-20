@@ -383,6 +383,10 @@ func (s *scanner) readNumber() token {
 			}
 			s.buffer.Reset()
 		}
+		// Lua 5.4: trailing alpha or underscore after hex number is malformed
+		if isAlpha(s.current) || s.current == '_' {
+			s.numberError()
+		}
 		// Lua 5.3: hex integer if no decimal point or 'p' exponent
 		// Note: We check !isFloat, not exponent==0, because overflow tracking
 		// may set exponent for float calculations, but integers use wrapping uint64
@@ -425,6 +429,10 @@ func (s *scanner) readNumber() token {
 		}
 		_ = s.readDigits()
 	}
+	// Lua 5.4: trailing alpha or underscore after number is malformed
+	if isAlpha(s.current) || s.current == '_' {
+		s.saveAndAdvance()
+	}
 	str := s.buffer.String()
 	if strings.HasPrefix(str, "0") {
 		if str = strings.TrimLeft(str, "0"); str == "" || !isDecimal(rune(str[0])) {
@@ -441,6 +449,10 @@ func (s *scanner) readNumber() token {
 	}
 	f, err := strconv.ParseFloat(str, bits64)
 	if err != nil {
+		// Accept overflow to +/-Inf (e.g., 1e9999) like C Lua does
+		if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+			return token{t: tkNumber, n: f, raw: str}
+		}
 		s.numberError()
 	}
 	return token{t: tkNumber, n: f, raw: str}
@@ -493,8 +505,9 @@ func (s *scanner) readDecimalEscape() (r rune) {
 	return
 }
 
-// readUnicodeEscape reads a \u{xxxx} Unicode escape sequence (Lua 5.3).
+// readUnicodeEscape reads a \u{xxxx} Unicode escape sequence (Lua 5.3/5.4).
 // Returns the UTF-8 encoding of the codepoint.
+// Lua 5.4 allows codepoints up to 0x7FFFFFFF (not just 0x10FFFF).
 func (s *scanner) readUnicodeEscape() string {
 	s.advance() // skip 'u'
 	if s.current != '{' {
@@ -502,7 +515,7 @@ func (s *scanner) readUnicodeEscape() string {
 	}
 	s.advance() // skip '{'
 
-	var codepoint rune
+	var codepoint uint64
 	var digits []rune // track digits for error messages
 	digitCount := 0
 	for {
@@ -510,14 +523,14 @@ func (s *scanner) readUnicodeEscape() string {
 		if c == '}' {
 			break
 		}
-		var digit rune
+		var digit uint64
 		switch {
 		case '0' <= c && c <= '9':
-			digit = c - '0'
+			digit = uint64(c - '0')
 		case 'a' <= c && c <= 'f':
-			digit = c - 'a' + 10
+			digit = uint64(c-'a') + 10
 		case 'A' <= c && c <= 'F':
-			digit = c - 'A' + 10
+			digit = uint64(c-'A') + 10
 		default:
 			seq := append([]rune{'u', '{'}, digits...)
 			seq = append(seq, c)
@@ -526,7 +539,7 @@ func (s *scanner) readUnicodeEscape() string {
 		digits = append(digits, c)
 		codepoint = codepoint*16 + digit
 		digitCount++
-		if codepoint > 0x10FFFF {
+		if codepoint > 0x7FFFFFFF {
 			seq := append([]rune{'u', '{'}, digits...)
 			s.escapeError(seq, "UTF-8 value too large")
 		}
@@ -537,34 +550,37 @@ func (s *scanner) readUnicodeEscape() string {
 	}
 	s.advance() // skip '}'
 
-	// Encode codepoint as UTF-8
-	buf := make([]byte, 4)
+	// Encode codepoint as modified UTF-8 (up to 6 bytes for Lua 5.4)
+	buf := make([]byte, 8)
 	n := encodeUTF8(buf, codepoint)
 	return string(buf[:n])
 }
 
-// encodeUTF8 encodes a rune as UTF-8 into buf and returns the number of bytes written.
-func encodeUTF8(buf []byte, r rune) int {
-	switch {
-	case r < 0x80:
-		buf[0] = byte(r)
+// encodeUTF8 encodes a codepoint as modified UTF-8 into buf.
+// Supports codepoints up to 0x7FFFFFFF (Lua 5.4 extended range).
+// Returns the number of bytes written.
+func encodeUTF8(buf []byte, x uint64) int {
+	if x < 0x80 {
+		buf[0] = byte(x)
 		return 1
-	case r < 0x800:
-		buf[0] = byte(0xC0 | (r >> 6))
-		buf[1] = byte(0x80 | (r & 0x3F))
-		return 2
-	case r < 0x10000:
-		buf[0] = byte(0xE0 | (r >> 12))
-		buf[1] = byte(0x80 | ((r >> 6) & 0x3F))
-		buf[2] = byte(0x80 | (r & 0x3F))
-		return 3
-	default:
-		buf[0] = byte(0xF0 | (r >> 18))
-		buf[1] = byte(0x80 | ((r >> 12) & 0x3F))
-		buf[2] = byte(0x80 | ((r >> 6) & 0x3F))
-		buf[3] = byte(0x80 | (r & 0x3F))
-		return 4
 	}
+	// Use the same algorithm as C Lua's luaO_utf8esc:
+	// Fill continuation bytes from the end, then add the lead byte.
+	n := 1
+	mfb := uint64(0x3f) // maximum that fits in first byte
+	for {
+		buf[8-n] = byte(0x80 | (x & 0x3f))
+		n++
+		x >>= 6
+		mfb >>= 1
+		if x <= mfb {
+			break
+		}
+	}
+	buf[8-n] = byte((^mfb << 1) | x)
+	// Copy to front of buffer
+	copy(buf[0:], buf[8-n:8])
+	return n
 }
 
 func (s *scanner) readString() token {

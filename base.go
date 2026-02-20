@@ -39,10 +39,11 @@ func pairs(method string, isZero bool, iter Function) Function {
 
 func intPairs(l *State) int {
 	i := CheckInteger(l, 2)
-	CheckType(l, 1, TypeTable)
 	i++ // next value
 	l.PushInteger(i)
-	l.RawGetInt(1, i)
+	// Use metamethod-aware table access (not raw) per Lua 5.4 semantics.
+	t := l.indexToValue(1)
+	l.apiPush(l.tableAt(t, int64(i)))
 	if l.IsNil(-1) {
 		return 1
 	}
@@ -133,10 +134,36 @@ func (r *genericReader) Read(b []byte) (n int, err error) {
 	return
 }
 
+func baseWarn(l *State) int {
+	n := l.Top()
+	ArgumentCheck(l, n > 0, 1, "string expected")
+	var msg strings.Builder
+	for i := 1; i <= n; i++ {
+		s := CheckString(l, i)
+		msg.WriteString(s)
+	}
+	text := msg.String()
+	// Control messages start with '@'
+	if len(text) > 0 && text[0] == '@' {
+		switch text {
+		case "@on":
+			l.warnEnabled = true
+		case "@off":
+			l.warnEnabled = false
+		}
+		return 0
+	}
+	if l.warnEnabled {
+		os.Stderr.WriteString("Lua warning: " + text + "\n")
+	}
+	return 0
+}
+
 func baseError(l *State) int {
 	level := OptInteger(l, 2, 1)
 	l.SetTop(1)
-	if l.IsString(1) && level > 0 {
+	// Lua 5.4: only add location info for actual string values (not numbers)
+	if l.TypeOf(1) == TypeString && level > 0 {
 		Where(l, level)
 		l.PushValue(1)
 		l.Concat(2)
@@ -369,6 +396,7 @@ var baseLibrary = []RegistryFunction{
 		l.Replace(2)
 		return finishProtectedCall(l, nil == l.ProtectedCallWithContinuation(n-2, MultipleReturns, 1, 0, protectedCallContinuation))
 	}},
+	{"warn", baseWarn},
 }
 
 // BaseOpen opens the basic library. Usually passed to Require.

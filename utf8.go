@@ -4,9 +4,9 @@ import (
 	"unicode/utf8"
 )
 
-// utf8Pattern matches exactly one UTF-8 byte sequence
-// This is the Lua pattern: [\0-\x7F\xC2-\xF4][\x80-\xBF]*
-const utf8Pattern = "[\x00-\x7F\xC2-\xF4][\x80-\xBF]*"
+// utf8Pattern matches exactly one UTF-8 byte sequence (including modified UTF-8)
+// This is the Lua 5.4 pattern: [\0-\x7F\xC2-\xFD][\x80-\xBF]*
+const utf8Pattern = "[\x00-\x7F\xC2-\xFD][\x80-\xBF]*"
 
 // decodeUTF8 decodes a single UTF-8 character from s starting at byte position pos (1-based).
 // Returns the rune, its size in bytes, and true if valid; otherwise returns 0, 0, false.
@@ -19,6 +19,54 @@ func decodeUTF8(s string, pos int) (rune, int, bool) {
 		return 0, 0, false
 	}
 	return r, size, true
+}
+
+// decodeUTF8Lax decodes a single modified UTF-8 character (1-based pos).
+// Accepts surrogates (U+D800..U+DFFF) and codepoints up to U+7FFFFFFF.
+func decodeUTF8Lax(s string, pos int) (rune, int, bool) {
+	if pos < 1 || pos > len(s) {
+		return 0, 0, false
+	}
+	b := s[pos-1:]
+	first := b[0]
+	switch {
+	case first < 0x80:
+		return rune(first), 1, true
+	case first < 0xC0:
+		return 0, 0, false // continuation byte
+	case first < 0xE0:
+		if len(b) < 2 || b[1]&0xC0 != 0x80 {
+			return 0, 0, false
+		}
+		r := rune(first&0x1F)<<6 | rune(b[1]&0x3F)
+		return r, 2, true
+	case first < 0xF0:
+		if len(b) < 3 || b[1]&0xC0 != 0x80 || b[2]&0xC0 != 0x80 {
+			return 0, 0, false
+		}
+		r := rune(first&0x0F)<<12 | rune(b[1]&0x3F)<<6 | rune(b[2]&0x3F)
+		return r, 3, true
+	case first < 0xF8:
+		if len(b) < 4 || b[1]&0xC0 != 0x80 || b[2]&0xC0 != 0x80 || b[3]&0xC0 != 0x80 {
+			return 0, 0, false
+		}
+		r := rune(first&0x07)<<18 | rune(b[1]&0x3F)<<12 | rune(b[2]&0x3F)<<6 | rune(b[3]&0x3F)
+		return r, 4, true
+	case first < 0xFC:
+		if len(b) < 5 || b[1]&0xC0 != 0x80 || b[2]&0xC0 != 0x80 || b[3]&0xC0 != 0x80 || b[4]&0xC0 != 0x80 {
+			return 0, 0, false
+		}
+		r := rune(first&0x03)<<24 | rune(b[1]&0x3F)<<18 | rune(b[2]&0x3F)<<12 | rune(b[3]&0x3F)<<6 | rune(b[4]&0x3F)
+		return r, 5, true
+	case first < 0xFE:
+		if len(b) < 6 || b[1]&0xC0 != 0x80 || b[2]&0xC0 != 0x80 || b[3]&0xC0 != 0x80 || b[4]&0xC0 != 0x80 || b[5]&0xC0 != 0x80 {
+			return 0, 0, false
+		}
+		r := rune(first&0x01)<<30 | rune(b[1]&0x3F)<<24 | rune(b[2]&0x3F)<<18 | rune(b[3]&0x3F)<<12 | rune(b[4]&0x3F)<<6 | rune(b[5]&0x3F)
+		return r, 6, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // utf8PosRelative converts a potentially negative position to a positive one.
@@ -37,63 +85,82 @@ var utf8Library = []RegistryFunction{
 	// utf8.char(...) - converts codepoints to UTF-8 string
 	{"char", func(l *State) int {
 		n := l.Top()
-		buf := make([]byte, 0, n*4) // UTF-8 uses at most 4 bytes per character
+		buf := make([]byte, 0, n*4)
 		for i := 1; i <= n; i++ {
 			code := CheckInteger(l, i)
-			if code < 0 || code > 0x10FFFF {
+			if code < 0 || code > 0x7FFFFFFF {
 				ArgumentError(l, i, "value out of range")
 			}
-			var tmp [4]byte
-			size := utf8.EncodeRune(tmp[:], rune(code))
+			var tmp [8]byte
+			size := encodeUTF8(tmp[:], uint64(code))
 			buf = append(buf, tmp[:size]...)
 		}
 		l.PushString(string(buf))
 		return 1
 	}},
 
-	// utf8.codes(s) - returns iterator function
+	// utf8.codes(s [, lax]) - returns iterator function, string, and 0
+	// The iterator uses the same position scheme as C Lua 5.4.8:
+	// control variable is the 1-based position of the last decoded char.
+	// On each call, skip continuation bytes at that position to find the next char.
 	{"codes", func(l *State) int {
-		CheckString(l, 1) // validate argument
+		s := CheckString(l, 1)
+		lax := l.ToBoolean(2)
+		// Check that string starts with a valid UTF-8 byte (not a continuation byte)
+		if !lax && len(s) > 0 && s[0]&0xC0 == 0x80 {
+			ArgumentError(l, 1, "invalid UTF-8 code")
+		}
+		// Capture lax in closure via upvalue
+		isLax := lax
 		l.PushGoFunction(func(l *State) int {
-			// Iterator: state is the string, control is the START position of previous char (or 0)
 			str := CheckString(l, 1)
-			prevPos := CheckInteger(l, 2)
-
-			var nextPos int
-			if prevPos == 0 {
-				nextPos = 1 // start from beginning
-			} else {
-				// Find the end of the character at prevPos, then advance
-				_, size, ok := decodeUTF8(str, prevPos)
-				if !ok {
-					Errorf(l, "invalid UTF-8 code at position %d", prevPos)
+			// n is the raw control value; cast to uint64 so negatives wrap to large values
+			nraw, _ := l.ToInteger64(2)
+			n := uint64(nraw)
+			slen := uint64(len(str))
+			// Skip continuation bytes at position n
+			if n < slen {
+				for n < slen && str[n]&0xC0 == 0x80 {
+					n++
 				}
-				nextPos = prevPos + size
 			}
-
-			if nextPos > len(str) {
-				return 0 // end of iteration
+			if n >= slen {
+				return 0 // no more codepoints
 			}
-
-			r, _, ok := decodeUTF8(str, nextPos)
-			if !ok {
-				Errorf(l, "invalid UTF-8 code at position %d", nextPos)
+			// Decode UTF-8 at position n (0-based index)
+			if isLax {
+				r, size, ok := decodeUTF8Lax(str, int(n)+1) // 1-based for decodeUTF8Lax
+				if !ok {
+					Errorf(l, "invalid UTF-8 code")
+				}
+				l.PushInteger(int(n) + 1) // 1-based position
+				l.PushInteger(int(r))     // codepoint
+				_ = size
+				return 2
 			}
-
-			l.PushInteger(nextPos) // becomes new control
-			l.PushInteger(int(r))
+			r, size := utf8.DecodeRuneInString(str[n:])
+			if r == utf8.RuneError && size <= 1 {
+				Errorf(l, "invalid UTF-8 code")
+			}
+			// Check that next byte after this char is not an orphan continuation
+			if n+uint64(size) < slen && str[n+uint64(size)]&0xC0 == 0x80 {
+				Errorf(l, "invalid UTF-8 code")
+			}
+			l.PushInteger(int(n) + 1) // 1-based position (also becomes control variable)
+			l.PushInteger(int(r))     // codepoint
 			return 2
 		})
 		l.PushValue(1)   // string as state
-		l.PushInteger(0) // initial position
+		l.PushInteger(0) // initial position (0 = before first char)
 		return 3
 	}},
 
-	// utf8.codepoint(s [, i [, j]]) - returns codepoints
+	// utf8.codepoint(s [, i [, j [, lax]]]) - returns codepoints
 	{"codepoint", func(l *State) int {
 		s := CheckString(l, 1)
 		i := utf8PosRelative(OptInteger(l, 2, 1), len(s))
 		j := utf8PosRelative(OptInteger(l, 3, i), len(s))
+		lax := l.ToBoolean(4)
 
 		// Empty range check first - if i > j, just return nothing
 		if i > j {
@@ -101,16 +168,21 @@ var utf8Library = []RegistryFunction{
 		}
 		// Only check bounds when we actually have a range to process
 		if i < 1 || i > len(s) {
-			ArgumentError(l, 2, "out of range")
+			ArgumentError(l, 2, "out of bounds")
 		}
 		if j > len(s) {
-			ArgumentError(l, 3, "out of range")
+			ArgumentError(l, 3, "out of bounds")
+		}
+
+		decode := decodeUTF8
+		if lax {
+			decode = decodeUTF8Lax
 		}
 
 		n := 0
 		pos := i
 		for pos <= j {
-			r, size, ok := decodeUTF8(s, pos)
+			r, size, ok := decode(s, pos)
 			if !ok {
 				Errorf(l, "invalid UTF-8 code at position %d", pos)
 			}
@@ -121,28 +193,30 @@ var utf8Library = []RegistryFunction{
 		return n
 	}},
 
-	// utf8.len(s [, i [, j]]) - returns number of characters
+	// utf8.len(s [, i [, j [, lax]]]) - returns number of characters
 	{"len", func(l *State) int {
 		s := CheckString(l, 1)
 		i := utf8PosRelative(OptInteger(l, 2, 1), len(s))
-		j := utf8PosRelative(OptInteger(l, 3, len(s)), len(s))
+		j := utf8PosRelative(OptInteger(l, 3, -1), len(s))
+		lax := l.ToBoolean(4)
 
-		if i < 1 {
-			i = 1
-		}
-		if j > len(s) {
-			j = len(s)
-		}
+		ArgumentCheck(l, 1 <= i && i <= len(s)+1, 2, "initial position out of bounds")
+		ArgumentCheck(l, j <= len(s), 3, "final position out of bounds")
 		if i > j {
 			l.PushInteger(0)
 			return 1
 		}
 
+		decode := decodeUTF8
+		if lax {
+			decode = decodeUTF8Lax
+		}
+
 		count := 0
 		pos := i
 		for pos <= j {
-			r, size, ok := decodeUTF8(s, pos)
-			if !ok || r == utf8.RuneError {
+			r, size, ok := decode(s, pos)
+			if !ok || (!lax && r == utf8.RuneError) {
 				// Return nil and the position of the invalid byte
 				l.PushNil()
 				l.PushInteger(pos)
@@ -156,78 +230,54 @@ var utf8Library = []RegistryFunction{
 	}},
 
 	// utf8.offset(s, n [, i]) - returns byte position of n-th character
+	// Like C Lua, navigates by continuation bytes without decoding.
 	{"offset", func(l *State) int {
 		s := CheckString(l, 1)
 		n := CheckInteger(l, 2)
-		var i int
+		var posi int
 		if n >= 0 {
-			i = OptInteger(l, 3, 1)
+			posi = OptInteger(l, 3, 1)
 		} else {
-			i = OptInteger(l, 3, len(s)+1)
+			posi = OptInteger(l, 3, len(s)+1)
 		}
 
-		if i < 1 || i > len(s)+1 {
-			ArgumentError(l, 3, "position out of range")
-		}
-
-		// For n != 0, the initial position must not be a continuation byte
-		if n != 0 && i <= len(s) && isContinuationByte(s[i-1]) {
-			ArgumentError(l, 3, "initial position is a continuation byte")
-		}
+		ArgumentCheck(l, 1 <= posi && posi <= len(s)+1, 3, "position out of bounds")
 
 		if n == 0 {
-			// Find the beginning of the character at position i
-			// Note: i can be len(s)+1, so we must check i <= len(s) before accessing s[i-1]
-			for i > 1 && i <= len(s) && isContinuationByte(s[i-1]) {
-				i--
-			}
-			l.PushInteger(i)
-			return 1
-		}
-
-		if n > 0 {
-			// Move forward n characters from position i
-			pos := i
-			// First, make sure we're at the start of a character
-			for pos <= len(s) && isContinuationByte(s[pos-1]) {
-				pos++
-			}
-			n-- // We're at the first character already
-			for n > 0 && pos <= len(s) {
-				_, size, ok := decodeUTF8(s, pos)
-				if !ok {
-					l.PushNil()
-					return 1
-				}
-				pos += size
-				n--
-			}
-			if n == 0 && pos <= len(s)+1 {
-				l.PushInteger(pos)
-				return 1
+			// Find beginning of current byte sequence
+			for posi > 1 && posi <= len(s) && isContinuationByte(s[posi-1]) {
+				posi--
 			}
 		} else {
-			// Move backward -n characters from position i
-			pos := i
-			// Move to the start of the current character
-			// Note: pos can be len(s)+1, so we must check pos <= len(s) before accessing s[pos-1]
-			for pos > 1 && pos <= len(s) && isContinuationByte(s[pos-1]) {
-				pos--
+			if posi <= len(s) && isContinuationByte(s[posi-1]) {
+				Errorf(l, "initial position is a continuation byte")
 			}
-			for n < 0 && pos > 1 {
-				pos--
-				for pos > 1 && isContinuationByte(s[pos-1]) {
-					pos--
+			if n < 0 {
+				for n < 0 && posi > 1 {
+					// Find beginning of previous character
+					posi--
+					for posi > 1 && isContinuationByte(s[posi-1]) {
+						posi--
+					}
+					n++
 				}
-				n++
-			}
-			if n == 0 {
-				l.PushInteger(pos)
-				return 1
+			} else {
+				n-- // Don't count character at 'posi'
+				for n > 0 && posi <= len(s) {
+					// Find beginning of next character
+					posi++
+					for posi <= len(s) && isContinuationByte(s[posi-1]) {
+						posi++
+					}
+					n--
+				}
 			}
 		}
-
-		l.PushNil()
+		if n == 0 {
+			l.PushInteger(posi)
+		} else {
+			l.PushNil()
+		}
 		return 1
 	}},
 }

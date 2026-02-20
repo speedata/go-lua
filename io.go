@@ -418,12 +418,17 @@ var ioLibrary = []RegistryFunction{
 			l.Replace(1)
 			toFile(l)
 			lines(l, false)
-		} else {
-			forceOpen(l, CheckString(l, 1), "r")
-			l.Replace(1)
-			lines(l, true)
+			return 1
 		}
-		return 1
+		// Lua 5.4: io.lines(filename) returns 4 values for generic for-in:
+		// iterator, file_stream, nil, file_stream (TBC)
+		forceOpen(l, CheckString(l, 1), "r")
+		l.Replace(1)
+		lines(l, true)    // pushes iterator closure
+		l.PushValue(1)    // push file stream as 2nd result
+		l.PushNil()       // push nil as 3rd result
+		l.PushValue(1)    // push file stream as 4th result (to-be-closed)
+		return 4
 	}},
 	{"open", func(l *State) int {
 		name := CheckString(l, 1)
@@ -557,7 +562,11 @@ var ioLibrary = []RegistryFunction{
 }
 
 var fileHandleMethods = []RegistryFunction{
-	{"close", close},
+	{"close", func(l *State) int {
+		// file:close() method — requires self argument, no default fallback
+		toFile(l)
+		return closeHelper(l)
+	}},
 	{"flush", func(l *State) int { return FileResult(l, toFile(l).Sync(), "") }},
 	{"lines", func(l *State) int { toFile(l); lines(l, false); return 1 }},
 	{"read", func(l *State) int { return read(l, toFile(l), 2) }},
@@ -623,6 +632,16 @@ func IOOpen(l *State) int {
 	l.PushValue(-1)
 	l.SetField(-2, "__index")
 	SetFunctions(l, fileHandleMethods, 0)
+	// Lua 5.4: file handles need __close for to-be-closed variables.
+	// Like C Lua's f_gc: check if already closed, skip if so.
+	l.PushGoFunction(func(l *State) int {
+		s := toStream(l)
+		if s.close == nil {
+			return 0 // already closed, nothing to do
+		}
+		return closeHelper(l)
+	})
+	l.SetField(-2, "__close")
 	l.Pop(1)
 
 	registerStdFile(l, os.Stdin, input, "stdin")

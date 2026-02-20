@@ -27,8 +27,12 @@ const (
 	tmLE
 	tmConcat
 	tmCall
+	tmClose // Lua 5.4: __close for to-be-closed variables
 	tmCount // number of tag methods
 )
+
+// tmFromC converts a C field value (used in MMBIN instructions) to a tm constant.
+func tmFromC(c int) tm { return tm(c) }
 
 var eventNames = []string{
 	"__index",
@@ -55,6 +59,7 @@ var eventNames = []string{
 	"__le",
 	"__concat",
 	"__call",
+	"__close",
 }
 
 var typeNames = []string{

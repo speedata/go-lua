@@ -104,6 +104,17 @@ func (l *State) newUpValueAt(level int) *upValue {
 }
 
 func (l *State) close(level int) {
+	l.closeUpValues(level)
+	l.closeTBC(level)
+}
+
+// closeWithError closes upvalues and TBC variables, passing errObj to __close handlers.
+func (l *State) closeWithError(level int, errObj value) {
+	l.closeUpValues(level)
+	l.closeTBCWithErr(level, errObj, false)
+}
+
+func (l *State) closeUpValues(level int) {
 	// TODO this seems really inefficient - how can we terminate early?
 	var p *openUpValue
 	for e := l.upValues; e != nil; e, p = e.next, e {
@@ -118,6 +129,88 @@ func (l *State) close(level int) {
 	}
 }
 
+// newTBCUpValue registers a stack index as a to-be-closed variable.
+func (l *State) newTBCUpValue(level int) {
+	l.tbcList = append(l.tbcList, level)
+}
+
+// closeTBC calls __close metamethods for to-be-closed variables at or above level.
+// errObj is passed as the error argument to each handler (nil for normal close).
+// If a handler throws, the error propagates normally.
+func (l *State) closeTBC(level int) {
+	l.closeTBCWithErr(level, nil, false)
+}
+
+// closeTBCWithErr calls __close metamethods passing errObj to each handler.
+// If yieldable is true, the __close handlers may yield (for use inside coroutines).
+func (l *State) closeTBCWithErr(level int, errObj value, yieldable bool) {
+	for len(l.tbcList) > 0 {
+		idx := l.tbcList[len(l.tbcList)-1]
+		if idx < level {
+			break
+		}
+		l.tbcList = l.tbcList[:len(l.tbcList)-1]
+		obj := l.stack[idx]
+		if obj == nil || obj == false {
+			continue
+		}
+		tm := l.tagMethodByObject(obj, tmClose)
+		// Push and call even if tm is nil — this matches C Lua behavior
+		// and will produce "attempt to call a nil value" with proper debug info.
+		l.push(tm)
+		l.push(obj)
+		l.push(errObj) // error object (nil for normal close, or actual error)
+		l.call(l.top-3, 0, yieldable)
+	}
+}
+
+// closeYieldable closes upvalues and TBC variables, allowing __close handlers to yield.
+// Used by opClose, opReturn, opReturn0, opReturn1 inside coroutines.
+func (l *State) closeYieldable(level int) {
+	l.closeUpValues(level)
+	l.closeTBCWithErr(level, nil, true)
+}
+
+// closeTBCProtected calls __close metamethods in protected mode with error chaining.
+// Like C Lua's luaD_closeprotected: if a handler throws, the error is caught,
+// passed to subsequent handlers, and the final error value is returned.
+// initialErr is the error that triggered the close (nil for normal close).
+func (l *State) closeTBCProtected(level int, initialErr value) (finalErr value) {
+	errObj := initialErr
+	for len(l.tbcList) > 0 {
+		idx := l.tbcList[len(l.tbcList)-1]
+		if idx < level {
+			break
+		}
+		l.tbcList = l.tbcList[:len(l.tbcList)-1]
+		obj := l.stack[idx]
+		if obj == nil || obj == false {
+			continue
+		}
+		tm := l.tagMethodByObject(obj, tmClose)
+		// Call even if tm is nil — matches C Lua behavior where callclosemethod
+		// pushes tm unconditionally. If nil/non-callable, the call will error.
+		savedCI := l.callInfo
+		savedTop := l.top
+		callErr := l.protect(func() {
+			l.push(tm)
+			l.push(obj)
+			l.push(errObj) // pass current error (nil initially, or chained error)
+			l.call(l.top-3, 0, false)
+		})
+		if callErr != nil {
+			// Handler threw — error value is at l.stack[l.top-1]
+			// Extract it before restoring state
+			if l.top > savedTop {
+				errObj = l.stack[l.top-1]
+			}
+			l.callInfo = savedCI
+			l.top = savedTop
+		}
+	}
+	return errObj
+}
+
 // information about a call
 type callInfo struct {
 	function, top, resultCount int
@@ -128,9 +221,10 @@ type callInfo struct {
 }
 
 type luaCallInfo struct {
-	frame   []value
-	savedPC pc
-	code    []instruction
+	frame    []value
+	savedPC  pc
+	code     []instruction
+	savedTop int // l.top saved before TBC close (for yield-resume with b==0)
 }
 
 type goCallInfo struct {
@@ -138,6 +232,8 @@ type goCallInfo struct {
 	continuation                     Function
 	oldAllowHook, shouldYield        bool
 	error                            error
+	recoverStatus                    error // error status during pcall TBC close recovery (like C Lua's CIST_RECST)
+	recoverErrObj                    value // error value to pass to __close handlers during recovery
 }
 
 func (ci *callInfo) setCallStatus(flag callStatus)     { ci.callStatus |= flag }
@@ -295,16 +391,20 @@ func (l *State) preCall(function int, resultCount int) bool {
 				base = l.adjustVarArgs(p, argCount)
 			}
 			ci := l.pushLuaFrame(function, base, resultCount, p)
-			if l.hookMask&MaskCall != 0 {
-				l.callHook(ci)
+			if l.hookMask != 0 && !p.isVarArg {
+				// For non-vararg functions: set oldpc and call hook now
+				// (matches luaG_tracecall → luaD_hookcall)
+				l.oldPC = 0
+				if l.hookMask&MaskCall != 0 {
+					l.callHook(ci)
+				}
 			}
+			// For vararg functions, hook setup is deferred to opVarArgPrep
 			return false
 		default:
 			tm := l.tagMethodByObject(f, tmCall)
-			switch tm.(type) {
-			case closure:
-			case *goFunction:
-			default:
+
+			if tm == nil {
 				l.typeErrorAt(function, "call")
 			}
 			// Slide the args + function up 1 slot and poke in the tag method
@@ -320,7 +420,7 @@ func (l *State) preCall(function int, resultCount int) bool {
 
 func (l *State) callHook(ci *callInfo) {
 	ci.savedPC++ // hooks assume 'pc' is already incremented
-	if pci := ci.previous; pci.isLua() && pci.code[pci.savedPC-1].opCode() == opTailCall {
+	if pci := ci.previous; pci.isLua() && pci.savedPC > 0 && len(pci.code) > 0 && pci.code[pci.savedPC-1].opCode() == opTailCall {
 		ci.setCallStatus(callStatusTail)
 		l.hook(HookTailCall, -1)
 	} else {
@@ -363,8 +463,12 @@ func (l *State) postCall(firstResult int) bool {
 		result++
 	}
 	l.top = result
-	if l.hookMask&(MaskReturn|MaskLine) != 0 {
-		l.oldPC = l.callInfo.savedPC // oldPC for caller function
+	if l.hookMask&(MaskReturn|MaskLine) != 0 && l.callInfo.isLua() {
+		// Match C Lua rethook: pcRel(savedpc) = savedpc_index - 1
+		// This makes oldPC point to the CALL instruction itself, so the
+		// next traceExecution won't fire a spurious line hook for the
+		// same line as the CALL.
+		l.oldPC = l.callInfo.savedPC - 1 // oldPC for caller function
 	}
 	return wanted != MultipleReturns
 }

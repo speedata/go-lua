@@ -1,21 +1,27 @@
 # go-lua
 
-A Lua 5.3 VM in pure Go — no CGo, no dependencies.
+A Lua 5.4 VM in pure Go — no CGo, no dependencies.
 
-This is a fork of [Shopify/go-lua](https://github.com/Shopify/go-lua), upgraded from Lua 5.2 to **Lua 5.3**.
+This is a fork of [Shopify/go-lua](https://github.com/Shopify/go-lua), upgraded from Lua 5.3 to **Lua 5.4**.
 
 ## What's new compared to Shopify/go-lua?
 
 - Native 64-bit integers (`int64`) alongside floats (`float64`)
 - Bitwise operators: `&`, `|`, `~`, `<<`, `>>` and unary `~`
 - Integer division: `//`
-- Coroutines: `coroutine.create`, `resume`, `yield`, `wrap`, `status`, `running`
+- Coroutines: `coroutine.create`, `resume`, `yield`, `wrap`, `status`, `running`, `close`, `isyieldable`
 - UTF-8 library: `utf8.char`, `utf8.codes`, `utf8.codepoint`, `utf8.len`, `utf8.offset`
 - String packing: `string.pack`, `string.unpack`, `string.packsize`
+- String dump: `string.dump` (with strip option)
 - Math extensions: `math.tointeger`, `math.type`, `math.ult`, `math.maxinteger`, `math.mininteger`
 - Table move: `table.move(a1, f, e, t [,a2])`
 - Table metamethods: `table.insert`, `table.remove`, `table.sort` respect `__index`/`__newindex`
 - Hex float format: `string.format` supports `%a`/`%A`
+- To-be-closed variables: `<close>` attribute and `__close` metamethod
+- Const variables: `<const>` attribute
+- Generalized `for` with to-be-closed control variable
+- `warn()` function
+- Debug library: `debug.getlocal`, `debug.setlocal`, `debug.getinfo`, `debug.sethook` (including coroutine hooks)
 
 ## Getting started
 
@@ -76,7 +82,7 @@ lua.DoString(l, `print(add(2, 3))`) // 5
 
 ## Test suite status
 
-We run the official Lua 5.3 test suites. Currently **19 out of 24** pass:
+We run the official Lua 5.4 test suites. Currently **21 out of 25** pass:
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -86,6 +92,7 @@ We run the official Lua 5.3 test suites. Currently **19 out of 24** pass:
 | code | Pass | |
 | constructs | Pass | |
 | coroutine | Pass | |
+| db (debug) | Pass | |
 | errors | Pass | |
 | events | Pass | |
 | files | Pass | |
@@ -93,14 +100,14 @@ We run the official Lua 5.3 test suites. Currently **19 out of 24** pass:
 | literals | Pass | |
 | locals | Pass | |
 | math | Pass | |
+| nextvar | Pass | |
 | pm (pattern matching) | Pass | |
 | sort | Pass | |
 | strings | Pass | |
 | tpack (string.pack) | Pass | |
 | utf8 | Pass | |
 | vararg | Pass | |
-| attrib | — | Needs `debug.getinfo`, weak refs |
-| db | — | Needs `debug.getlocal` for coroutines |
+| attrib | — | Needs weak references |
 | gc | — | Go's GC, not controllable like Lua's |
 | big | — | Tables with >2^18 elements |
 | main | — | Requires standalone Lua binary |
@@ -108,8 +115,6 @@ We run the official Lua 5.3 test suites. Currently **19 out of 24** pass:
 ## Known limitations
 
 - **No weak references** — `__mode` on metatables is not supported (Go's GC doesn't offer that hook)
-- **No `string.dump`** — serializing functions to bytecode is not implemented
-- **Partial `debug` library** — `debug.getlocal` and `debug.upvalueid` are not yet implemented
 - **No C API** — pure Go, so C Lua libraries won't work (that's kind of the point though)
 
 ## Development
@@ -120,7 +125,7 @@ go build ./...
 go test ./...
 ```
 
-Some tests optionally use `luac` 5.3 for compiling Lua source to bytecode. If it's not in your PATH, those tests get skipped automatically.
+Some tests optionally use `luac` 5.4 for compiling Lua source to bytecode. If it's not in your PATH, those tests get skipped automatically.
 
 ## License
 

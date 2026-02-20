@@ -14,12 +14,12 @@ func (l *State) prototype(ci *callInfo) *prototype {
 	return l.stack[ci.function].(*luaClosure).prototype
 }
 func (l *State) currentLine(ci *callInfo) int {
-	return int(l.prototype(ci).lineInfo[ci.savedPC-1])
+	return getFuncLine(l.prototype(ci), int(ci.savedPC-1))
 }
 
 func chunkID(source string) string {
 	if len(source) == 0 {
-		return "[string \"?\"]"
+		return "[string \"\"]"
 	}
 	bufflen := idSize // available characters (including '\0' in C, we use as max length)
 	switch source[0] {
@@ -162,6 +162,17 @@ func (l *State) typeErrorAt(stackIdx int, operation string) {
 	typeName := l.objectTypeName(v)
 	if kind, name := l.varInfo(v, stackIdx); kind != "" {
 		l.runtimeError(fmt.Sprintf("attempt to %s a %s value (%s '%s')", operation, typeName, kind, name))
+	}
+	// For "call" operations, check the calling instruction context as fallback.
+	// This handles __close calls where the value was pushed by Go code (not bytecode),
+	// so varInfo can't find it. Like C Lua's funcnamefromcall in luaG_callerror.
+	if operation == "call" {
+		if ci := l.callInfo; ci.isLua() {
+			name, kind := l.functionName(ci)
+			if kind != "" {
+				l.runtimeError(fmt.Sprintf("attempt to %s a %s value (%s '%s')", operation, typeName, kind, name))
+			}
+		}
 	}
 	l.runtimeError(fmt.Sprintf("attempt to %s a %s value", operation, typeName))
 }
@@ -336,7 +347,7 @@ func DebugHook(l *State) Hook { return l.hooker }
 func DebugHookMask(l *State) byte { return l.hookMask }
 
 // DebugHookCount returns the current hook count.
-func DebugHookCount(l *State) int { return l.hookCount }
+func DebugHookCount(l *State) int { return l.baseHookCount }
 
 // Stack gets information about the interpreter runtime stack.
 //
@@ -362,15 +373,12 @@ func Stack(l *State, level int) (f Frame, ok bool) {
 func functionInfo(p Debug, f closure) (d Debug) {
 	d = p
 	if l, ok := f.(*luaClosure); !ok {
-		d.Source = "=[Go]"
+		d.Source = "=[C]"
 		d.LineDefined, d.LastLineDefined = -1, -1
-		d.What = "Go"
+		d.What = "C"
 	} else {
 		p := l.prototype
 		d.Source = p.source
-		if d.Source == "" {
-			d.Source = "=?"
-		}
 		d.LineDefined, d.LastLineDefined = p.lineDefined, p.lastLineDefined
 		d.What = "Lua"
 		if d.LineDefined == 0 {
@@ -385,6 +393,9 @@ func (l *State) functionName(ci *callInfo) (name, kind string) {
 	if ci == &l.baseCallInfo {
 		return
 	}
+	if ci.isCallStatus(callStatusHooked) {
+		return "?", "hook"
+	}
 	var tm tm
 	p := l.prototype(ci)
 	// savedPC points to the NEXT instruction to execute, so subtract 1
@@ -398,11 +409,13 @@ func (l *State) functionName(ci *callInfo) (name, kind string) {
 		return p.objectName(i.a(), pc)
 	case opTForCall:
 		return "for iterator", "for iterator"
-	case opSelf, opGetTableUp, opGetTable:
+	case opSelf, opGetTableUp, opGetTable, opGetI, opGetField:
 		tm = tmIndex
-	case opSetTableUp, opSetTable:
+	case opSetTableUp, opSetTable, opSetI, opSetField:
 		tm = tmNewIndex
-	case opEqual:
+	case opMMBin, opMMBinI, opMMBinK:
+		tm = tmFromC(i.c()) // C field holds the TM event
+	case opEqual, opEqualI, opEqualK:
 		tm = tmEq
 	case opAdd:
 		tm = tmAdd
@@ -412,34 +425,146 @@ func (l *State) functionName(ci *callInfo) (name, kind string) {
 		tm = tmMul
 	case opDiv:
 		tm = tmDiv
+	case opIDiv:
+		tm = tmIDiv
 	case opMod:
 		tm = tmMod
 	case opPow:
 		tm = tmPow
 	case opUnaryMinus:
 		tm = tmUnaryMinus
+	case opBNot:
+		tm = tmBNot
 	case opLength:
 		tm = tmLen
-	case opLessThan:
+	case opBAnd:
+		tm = tmBAnd
+	case opBOr:
+		tm = tmBOr
+	case opBXor:
+		tm = tmBXor
+	case opShl:
+		tm = tmShl
+	case opShr:
+		tm = tmShr
+	case opLessThan, opLessThanI, opGreaterThanI:
 		tm = tmLT
-	case opLessOrEqual:
+	case opLessOrEqual, opLessOrEqualI, opGreaterOrEqualI:
 		tm = tmLE
 	case opConcat:
 		tm = tmConcat
+	case opClose, opReturn, opReturn0, opReturn1:
+		tm = tmClose
 	default:
 		return
 	}
-	return eventNames[tm], "metamethod"
+	// Strip "__" prefix from event name (like C Lua's +2 offset)
+	name = eventNames[tm]
+	if len(name) > 2 && name[:2] == "__" {
+		name = name[2:]
+	}
+	return name, "metamethod"
+}
+
+// getLocal returns the name and value of local variable n (1-based) in the
+// given call frame. Returns ("", nil) if the local doesn't exist.
+// This implements C Lua's findlocal + lua_getlocal.
+func (l *State) getLocal(ci *callInfo, n int) (string, value) {
+	if ci.isLua() {
+		if n < 0 {
+			// Access vararg values (negative index)
+			p := l.stack[ci.function].(*luaClosure).prototype
+			if p.isVarArg {
+				base := ci.base()
+				nextra := base - ci.function - 1 - p.parameterCount
+				if n >= -nextra {
+					// vararg at position: function + parameterCount + (-n)
+					pos := ci.function + p.parameterCount - n
+					return "(vararg)", l.stack[pos]
+				}
+			}
+			return "", nil
+		}
+		p := l.stack[ci.function].(*luaClosure).prototype
+		currentPC := ci.savedPC - 1
+		if currentPC < 0 {
+			currentPC = 0
+		}
+		name, found := p.localName(n, pc(currentPC))
+		if found && n-1 >= 0 && n-1 < len(ci.frame) {
+			// Lua 5.4: prefix const/close variable names with parentheses
+			kind := p.localKind(n, pc(currentPC))
+			if kind == varConst || kind == varToClose || kind == varCTC {
+				name = "(" + name + ")"
+			}
+			return name, ci.frame[n-1]
+		}
+		// Check for temporary slots (no debug name but valid stack slot)
+		if n > 0 && n <= len(ci.frame) {
+			return "(temporary)", ci.frame[n-1]
+		}
+	} else {
+		// Go/C function: locals are on the stack between function+1 and limit
+		base := ci.function + 1
+		var limit int
+		if ci == l.callInfo {
+			limit = l.top
+		} else if ci.next != nil {
+			limit = ci.next.function
+		} else {
+			limit = l.top
+		}
+		count := limit - base
+		if n > 0 && n <= count {
+			return "(C temporary)", l.stack[base+n-1]
+		}
+	}
+	return "", nil
+}
+
+// setLocal sets the value of local variable n (1-based) in the given call frame
+// to the value at the top of the stack. Pops the value from the stack.
+func (l *State) setLocal(ci *callInfo, n int) {
+	l.top--
+	val := l.stack[l.top]
+	if ci.isLua() {
+		if n < 0 {
+			// Set vararg value (negative index)
+			p := l.stack[ci.function].(*luaClosure).prototype
+			if p.isVarArg {
+				base := ci.base()
+				nextra := base - ci.function - 1 - p.parameterCount
+				if n >= -nextra {
+					pos := ci.function + p.parameterCount - n
+					l.stack[pos] = val
+				}
+			}
+		} else if n > 0 && n-1 < len(ci.frame) {
+			ci.frame[n-1] = val
+		}
+	} else {
+		base := ci.function + 1
+		if n > 0 {
+			l.stack[base+n-1] = val
+		}
+	}
 }
 
 func (l *State) collectValidLines(f closure) {
 	if lc, ok := f.(*luaClosure); !ok {
 		l.apiPush(nil)
 	} else {
+		p := lc.prototype
 		t := newTable()
 		l.apiPush(t)
-		for _, i := range lc.prototype.lineInfo {
-			t.putAtInt(int(i), true)
+		// Lua 5.4: lineInfo is relative deltas; resolve each PC to absolute line number.
+		// For vararg functions, skip instruction 0 (VARARGPREP) — matches C Lua.
+		start := 0
+		if p.isVarArg {
+			start = 1
+		}
+		for pc := start; pc < len(p.lineInfo); pc++ {
+			t.putAtInt(getFuncLine(p, pc), true)
 		}
 	}
 }
@@ -537,6 +662,8 @@ func Info(l *State, what string, where Frame) (d Debug, ok bool) {
 				d.NameKind = "" // not found
 				d.Name = ""
 			}
+		case 'r':
+			// transfer info (ftransfer/ntransfer) - not implemented, leave as 0
 		case 'L':
 			hasL = true
 		case 'f':
@@ -546,7 +673,7 @@ func Info(l *State, what string, where Frame) (d Debug, ok bool) {
 		}
 	}
 	if hasF {
-		l.apiPush(f)
+		l.apiPush(fun)
 	}
 	if hasL {
 		l.collectValidLines(f)
@@ -631,12 +758,18 @@ func stringToMask(s string, maskCount bool) (mask byte) {
 var debugLibrary = []RegistryFunction{
 	// {"debug", db_debug},
 	{"getuservalue", func(l *State) int {
-		if l.TypeOf(1) != TypeUserData {
+		// Lua 5.4: debug.getuservalue(u, n) -> value, bool
+		CheckType(l, 1, TypeUserData)
+		n := OptInteger(l, 2, 1)
+		if n != 1 {
+			// go-lua only supports one user value per userdata
 			l.PushNil()
-		} else {
-			l.UserValue(1)
+			l.PushBoolean(false)
+			return 2
 		}
-		return 1
+		l.UserValue(1)
+		l.PushBoolean(true)
+		return 2
 	}},
 	{"gethook", func(l *State) int {
 		_, l1 := threadArg(l)
@@ -659,7 +792,13 @@ var debugLibrary = []RegistryFunction{
 		// f can be a function or a stack level (integer)
 		// what is an optional string of options (default "flnStu")
 		arg := 1
-		// TODO: thread argument support would go here
+		var l1 *State
+		if l.IsThread(arg) {
+			l1 = l.ToThread(arg)
+			arg = 2
+		} else {
+			l1 = l
+		}
 
 		options := OptString(l, arg+1, "flnStu")
 
@@ -674,19 +813,44 @@ var debugLibrary = []RegistryFunction{
 		if l.IsFunction(arg) {
 			// Info about a function - use ">" prefix
 			l.PushValue(arg) // push function to top
-			d, ok = Info(l, ">"+options, nil)
+			if l1 != l {
+				XMove(l, l1, 1) // move function to l1
+			}
+			d, ok = Info(l1, ">"+options, nil)
+			if l1 != l && (hasF || hasL) {
+				// Move pushed values back to l
+				count := 0
+				if hasF {
+					count++
+				}
+				if hasL {
+					count++
+				}
+				XMove(l1, l, count)
+			}
 			if !ok {
 				ArgumentError(l, arg+1, "invalid option")
 			}
 		} else {
 			// Stack level
 			level := CheckInteger(l, arg)
-			ar, ok = Stack(l, level)
+			ar, ok = Stack(l1, level)
 			if !ok {
 				l.PushNil() // level out of range
 				return 1
 			}
-			d, ok = Info(l, options, ar)
+			d, ok = Info(l1, options, ar)
+			if l1 != l && (hasF || hasL) {
+				// Move pushed values back to l
+				count := 0
+				if hasF {
+					count++
+				}
+				if hasL {
+					count++
+				}
+				XMove(l1, l, count)
+			}
 			if !ok {
 				ArgumentError(l, arg+1, "invalid option")
 			}
@@ -725,7 +889,11 @@ var debugLibrary = []RegistryFunction{
 			l.SetField(resultIdx, "isvararg")
 		}
 		if strings.Contains(options, "n") {
-			l.PushString(d.Name)
+			if d.Name != "" {
+				l.PushString(d.Name)
+			} else {
+				l.PushNil()
+			}
 			l.SetField(resultIdx, "name")
 			l.PushString(d.NameKind)
 			l.SetField(resultIdx, "namewhat")
@@ -733,6 +901,12 @@ var debugLibrary = []RegistryFunction{
 		if strings.Contains(options, "t") {
 			l.PushBoolean(d.IsTailCall)
 			l.SetField(resultIdx, "istailcall")
+		}
+		if strings.Contains(options, "r") {
+			l.PushInteger(d.FTransfer)
+			l.SetField(resultIdx, "ftransfer")
+			l.PushInteger(d.NTransfer)
+			l.SetField(resultIdx, "ntransfer")
 		}
 
 		// 'f' and 'L' values were pushed by Info() before the result table
@@ -760,16 +934,72 @@ var debugLibrary = []RegistryFunction{
 		// Move result table to correct position and clean up
 		// Stack: ... [func?] [activelines?] [result_table]
 		if hasF || hasL {
-			// Move result table down, remove the extra values
-			l.Replace(resultIdx - 1)
-			if hasF && hasL {
-				l.Pop(1) // remove the other extra value
+			extra := 0
+			if hasF {
+				extra++
+			}
+			if hasL {
+				extra++
+			}
+			// Move result_table down over extra values, then pop leftovers
+			l.Replace(resultIdx - extra)
+			for i := 1; i < extra; i++ {
+				l.Pop(1)
 			}
 		}
 
 		return 1
 	}},
-	// {"getlocal", db_getlocal},
+	{"getlocal", func(l *State) int {
+		// debug.getlocal ([thread,] f, local)
+		arg := 1
+		var l1 *State
+		if l.IsThread(arg) {
+			l1 = l.ToThread(arg)
+			arg = 2 // skip thread argument
+		} else {
+			l1 = l
+		}
+
+		if l.IsFunction(arg) {
+			// Non-active function: return parameter names only
+			l.PushValue(arg)
+			f := l.stack[l.top-1]
+			l.top--
+			cl, ok := f.(*luaClosure)
+			if !ok {
+				l.PushNil()
+				return 1
+			}
+			n := CheckInteger(l, arg+1)
+			name, found := cl.prototype.localName(n, 0)
+			if !found {
+				l.PushNil()
+				return 1
+			}
+			l.PushString(name)
+			return 1
+		}
+
+		// Stack level
+		level := CheckInteger(l, arg)
+		n := CheckInteger(l, arg+1)
+
+		ar, ok := Stack(l1, level)
+		if !ok {
+			ArgumentError(l, arg, "level out of range")
+			return 0
+		}
+
+		name, val := l1.getLocal(ar, n)
+		if name == "" {
+			l.PushNil()
+			return 1
+		}
+		l.PushString(name)
+		l.push(val)
+		return 2
+	}},
 	{"getregistry", func(l *State) int { l.PushValue(RegistryIndex); return 1 }},
 	{"getmetatable", func(l *State) int {
 		CheckAny(l, 1)
@@ -789,16 +1019,21 @@ var debugLibrary = []RegistryFunction{
 	}},
 	{"upvalueid", func(l *State) int { l.PushLightUserData(UpValueId(l, 1, l.checkUpValue(1, 2))); return 1 }},
 	{"setuservalue", func(l *State) int {
-		if l.TypeOf(1) == TypeLightUserData {
-			ArgumentError(l, 1, "full userdata expected, got light userdata")
-		}
+		// Lua 5.4: debug.setuservalue(u, value, n) -> u, bool
 		CheckType(l, 1, TypeUserData)
-		if !l.IsNoneOrNil(2) {
-			CheckType(l, 2, TypeTable)
+		CheckAny(l, 2)
+		n := OptInteger(l, 3, 1)
+		l.SetTop(3) // ensure 3 slots
+		if n != 1 {
+			// go-lua only supports one user value per userdata
+			l.SetTop(1) // return just the userdata
+			l.PushBoolean(false)
+			return 2
 		}
 		l.SetTop(2)
 		l.SetUserValue(1)
-		return 1
+		l.PushBoolean(true)
+		return 2
 	}},
 	{"sethook", func(l *State) int {
 		var hook Hook
@@ -827,7 +1062,49 @@ var debugLibrary = []RegistryFunction{
 		l1.internalHook = true
 		return 0
 	}},
-	// {"setlocal", db_setlocal},
+	{"setcstacklimit", func(l *State) int {
+		// Lua 5.4: set C stack limit. Go doesn't have a C stack, so always
+		// return 0 (indicating failure, as in C Lua when the limit is invalid).
+		CheckInteger(l, 1)
+		l.PushInteger(0)
+		return 1
+	}},
+	{"setlocal", func(l *State) int {
+		// debug.setlocal ([thread,] level, local, value)
+		arg := 1
+		var l1 *State
+		if l.IsThread(arg) {
+			l1 = l.ToThread(arg)
+			arg = 2
+		} else {
+			l1 = l
+		}
+		level := CheckInteger(l, arg)
+		n := CheckInteger(l, arg+1)
+		CheckAny(l, arg+2)
+		ar, ok := Stack(l1, level)
+		if !ok {
+			ArgumentError(l, arg, "level out of range")
+			return 0
+		}
+		name, _ := l1.getLocal(ar, n)
+		if name == "" {
+			l.PushNil()
+			return 0
+		}
+		// Check if variable is read-only (const/close)
+		if name == "(const)" || name == "(close)" {
+			ArgumentError(l, arg+1, "constant or to-be-closed variable")
+		}
+		// Set the value — move value to l1 if needed
+		l.SetTop(arg + 2)
+		if l1 != l {
+			XMove(l, l1, 1) // move value to l1
+		}
+		l1.setLocal(ar, n)
+		l.PushString(name)
+		return 1
+	}},
 	{"setmetatable", func(l *State) int {
 		t := l.TypeOf(2)
 		ArgumentCheck(l, t == TypeNil || t == TypeTable, 2, "nil or table expected")

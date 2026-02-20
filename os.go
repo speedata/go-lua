@@ -2,13 +2,14 @@ package lua
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
 )
 
-func field(l *State, key string, def int) int {
+func field(l *State, key string, def int, delta int64) int {
 	l.Field(-1, key)
 	if l.IsNoneOrNil(-1) {
 		l.Pop(1)
@@ -17,7 +18,8 @@ func field(l *State, key string, def int) int {
 		}
 		return def
 	}
-	// Lua 5.3: field must be an exact integer (not a float or non-numeric string)
+	// Lua 5.4: field must be an exact integer (not a float or non-numeric string)
+	var res int64
 	if !l.IsInteger(-1) {
 		// Try to get as number and check if it's a whole number
 		if n, ok := l.ToNumber(-1); ok {
@@ -25,15 +27,28 @@ func field(l *State, key string, def int) int {
 				l.Pop(1)
 				Errorf(l, "field '%s' is not an integer", key)
 			}
+			res = int64(n)
+		} else {
 			l.Pop(1)
-			return int(int64(n))
+			Errorf(l, "field '%s' is not an integer", key)
+			return 0 // unreachable
 		}
-		l.Pop(1)
-		Errorf(l, "field '%s' is not an integer", key)
+	} else {
+		r, _ := l.ToInteger(-1)
+		res = int64(r)
 	}
-	r, _ := l.ToInteger(-1)
 	l.Pop(1)
-	return r
+	// Lua 5.4: check that (res - delta) fits in a C int (32-bit)
+	if res >= 0 {
+		if uint64(res) > uint64(math.MaxInt32)+uint64(delta) {
+			Errorf(l, "field '%s' is out-of-bound", key)
+		}
+	} else {
+		if int64(math.MinInt32)+delta > res {
+			Errorf(l, "field '%s' is out-of-bound", key)
+		}
+	}
+	return int(res)
 }
 
 // strftime formats a time according to C strftime-style format specifiers.
@@ -278,12 +293,12 @@ var osLibrary = []RegistryFunction{
 		} else {
 			CheckType(l, 1, TypeTable)
 			l.SetTop(1)
-			year := field(l, "year", -1)
-			month := field(l, "month", -1)
-			day := field(l, "day", -1)
-			hour := field(l, "hour", 12)
-			min := field(l, "min", 0)
-			sec := field(l, "sec", 0)
+			year := field(l, "year", -1, 1900)
+			month := field(l, "month", -1, 1)
+			day := field(l, "day", -1, 0)
+			hour := field(l, "hour", 12, 0)
+			min := field(l, "min", 0, 0)
+			sec := field(l, "sec", 0, 0)
 			t := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
 			l.PushNumber(float64(t.Unix()))
 			// Since Lua 5.3.3: normalize table fields
