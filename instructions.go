@@ -187,11 +187,12 @@ var opNames = []string{
 }
 
 // Lua 5.4 instruction layout:
-//   iABC:  op(7) | A(8) | k(1) | B(8) | C(8)
-//   iABx:  op(7) | A(8) |     Bx(17)
-//   iAsBx: op(7) | A(8) |    sBx(17)
-//   iAx:   op(7) |         Ax(25)
-//   isJ:   op(7) |         sJ(25)
+//
+//	iABC:  op(7) | A(8) | k(1) | B(8) | C(8)
+//	iABx:  op(7) | A(8) |     Bx(17)
+//	iAsBx: op(7) | A(8) |    sBx(17)
+//	iAx:   op(7) |         Ax(25)
+//	isJ:   op(7) |         sJ(25)
 const (
 	sizeC  = 8
 	sizeB  = 8
@@ -312,12 +313,13 @@ func (i instruction) String() string {
 }
 
 // Lua 5.4 opmode format:
-//   bits 0-2: op mode (iABC=0, iABx=1, iAsBx=2, iAx=3, isJ=4)
-//   bit 3: instruction sets register A
-//   bit 4: operator is a test (next instruction must be a jump)
-//   bit 5: instruction uses 'L->top' set by previous instruction (when B == 0)
-//   bit 6: instruction sets 'L->top' for next instruction (when C == 0)
-//   bit 7: instruction is an MM instruction (call a metamethod)
+//
+//	bits 0-2: op mode (iABC=0, iABx=1, iAsBx=2, iAx=3, isJ=4)
+//	bit 3: instruction sets register A
+//	bit 4: operator is a test (next instruction must be a jump)
+//	bit 5: instruction uses 'L->top' set by previous instruction (when B == 0)
+//	bit 6: instruction sets 'L->top' for next instruction (when C == 0)
+//	bit 7: instruction is an MM instruction (call a metamethod)
 func opmode(mm, ot, it, t, a, m int) byte {
 	return byte(mm<<7 | ot<<6 | it<<5 | t<<4 | a<<3 | m)
 }

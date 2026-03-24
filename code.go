@@ -138,9 +138,9 @@ type function struct {
 	freeRegisterCount   int
 	activeVariableCount int
 	firstLocal          int
-	firstLabel          int // Lua 5.4: first label index for this function (like C Lua's fs->firstlabel)
-	previousLine        int // Lua 5.4: for relative line info encoding (per-function, like C Lua's FuncState)
-	iwthabs             int // instructions without absolute line info
+	firstLabel          int  // Lua 5.4: first label index for this function (like C Lua's fs->firstlabel)
+	previousLine        int  // Lua 5.4: for relative line info encoding (per-function, like C Lua's FuncState)
+	iwthabs             int  // instructions without absolute line info
 	needClose           bool // Lua 5.4: function has TBC variables (affects RETURN k-bit)
 }
 
@@ -488,8 +488,8 @@ func (f *function) assertEqual(a, b interface{}) {
 
 const (
 	lineInfoAbs = -0x80 // marker for absolute line info in lineInfo
-	limLineDiff = 0x80   // max absolute delta that fits in int8
-	maxIWthAbs  = 128    // max instructions without absolute line info
+	limLineDiff = 0x80  // max absolute delta that fits in int8
+	maxIWthAbs  = 128   // max instructions without absolute line info
 )
 
 func (f *function) encode(i instruction) int {
@@ -601,7 +601,7 @@ func (f *function) Jump() int {
 	return f.Concatenate(f.encodeJ(opJump, noJump), jumpPC)
 }
 
-func (f *function) JumpTo(target int)             { f.PatchList(f.Jump(), target) }
+func (f *function) JumpTo(target int) { f.PatchList(f.Jump(), target) }
 func (f *function) ReturnNone() {
 	k := 0
 	if f.needClose {
@@ -1011,7 +1011,6 @@ func (f *function) ExpressionToValue(e exprDesc) exprDesc {
 	return f.DischargeVariables(e)
 }
 
-
 // exp2K tries to convert expression to a constant index in range.
 // Returns (constant index, true) if successful, (0, false) otherwise.
 func (f *function) exp2K(e exprDesc) (int, bool) {
@@ -1191,8 +1190,8 @@ func (f *function) Indexed(t, k exprDesc) exprDesc {
 	if t.kind == kindUpValue {
 		f.assert(f.isKstr(k))
 		r := makeExpression(kindIndexUp, 0)
-		r.table = t.info     // upvalue index
-		r.index = k.info     // string constant index
+		r.table = t.info // upvalue index
+		r.index = k.info // string constant index
 		return r
 	}
 	// table is in a register

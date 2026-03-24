@@ -69,7 +69,7 @@ var tokens []string = []string{
 type token struct {
 	t   rune
 	n   float64
-	i   int64  // Lua 5.3: integer value
+	i   int64 // Lua 5.3: integer value
 	s   string
 	raw string // original source text for error messages (txtToken)
 }
@@ -90,9 +90,9 @@ func (s *scanner) assert(cond bool)           { s.l.assert(cond) }
 func (s *scanner) syntaxError(message string) { s.scanError(message, s.t) }
 func (s *scanner) errorExpected(t rune)       { s.syntaxError(s.tokenToString(t) + " expected") }
 func (s *scanner) numberError()               { s.scanError("malformed number", tkNumber) }
-func isNewLine(c rune) bool { return c == '\n' || c == '\r' }
-func isDecimal(c rune) bool { return '0' <= c && c <= '9' }
-func isAlpha(c rune) bool   { return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') }
+func isNewLine(c rune) bool                   { return c == '\n' || c == '\r' }
+func isDecimal(c rune) bool                   { return '0' <= c && c <= '9' }
+func isAlpha(c rune) bool                     { return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') }
 
 func (s *scanner) tokenToString(t rune) string {
 	switch {

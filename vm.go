@@ -741,7 +741,6 @@ func expectNext(ci *callInfo, expected opCode) instruction {
 	return i
 }
 
-
 func (l *State) executeSwitch() {
 	ci := l.callInfo
 	frame, closure, constants := newFrame(l, ci)
@@ -1512,7 +1511,7 @@ func (l *State) executeSwitch() {
 						}
 					} else {
 						count = uint64(iInit) - uint64(iLimit)
-						count /= uint64(-(iStep+1)) + 1
+						count /= uint64(-(iStep + 1)) + 1
 					}
 					frame[a+1] = int64(count) // store counter in place of limit
 					// ra stays as init (unchanged)

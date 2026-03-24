@@ -211,7 +211,7 @@ type Function func(state *State) int
 type threadStatus byte
 
 const (
-	threadStatusOK    threadStatus = iota
+	threadStatusOK threadStatus = iota
 	threadStatusYield
 	threadStatusDead
 )
@@ -722,7 +722,7 @@ func (l *State) finishOp() {
 			l.concat(total) // concat remaining (may yield again)
 		}
 		ci.frame[a] = l.stack[l.top-1] // move final result
-		l.top = ci.top                  // restore top
+		l.top = ci.top                 // restore top
 	case opClose, opReturn0, opReturn1:
 		// yielded closing variables — repeat instruction to close others
 		ci.savedPC--

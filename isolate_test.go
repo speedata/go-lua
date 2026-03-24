@@ -393,4 +393,3 @@ func TestIsolateCallLine(t *testing.T) {
 		}
 	}
 }
-

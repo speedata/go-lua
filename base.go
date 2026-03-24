@@ -178,10 +178,10 @@ var baseLibrary = []RegistryFunction{
 			return l.Top() // return all arguments
 		}
 		CheckAny(l, 1)
-		l.Remove(1)                         // remove condition
-		l.PushString("assertion failed!")    // default message
-		l.SetTop(1)                         // leave only message (default if no other one)
-		return baseError(l)                 // call 'error'
+		l.Remove(1)                       // remove condition
+		l.PushString("assertion failed!") // default message
+		l.SetTop(1)                       // leave only message (default if no other one)
+		return baseError(l)               // call 'error'
 	}},
 	{"collectgarbage", func(l *State) int {
 		switch opt, _ := OptString(l, 1, "collect"), OptInteger(l, 2, 0); opt {

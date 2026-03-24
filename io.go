@@ -424,10 +424,10 @@ var ioLibrary = []RegistryFunction{
 		// iterator, file_stream, nil, file_stream (TBC)
 		forceOpen(l, CheckString(l, 1), "r")
 		l.Replace(1)
-		lines(l, true)    // pushes iterator closure
-		l.PushValue(1)    // push file stream as 2nd result
-		l.PushNil()       // push nil as 3rd result
-		l.PushValue(1)    // push file stream as 4th result (to-be-closed)
+		lines(l, true) // pushes iterator closure
+		l.PushValue(1) // push file stream as 2nd result
+		l.PushNil()    // push nil as 3rd result
+		l.PushValue(1) // push file stream as 4th result (to-be-closed)
 		return 4
 	}},
 	{"open", func(l *State) int {
