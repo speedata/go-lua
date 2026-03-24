@@ -571,7 +571,7 @@ func scanFormat(l *State, fs string) string {
 	for i < len(fs) && strings.ContainsRune(allFlags, rune(fs[i])) {
 		i++
 	}
-	i++ // include the conversion specifier
+	i++         // include the conversion specifier
 	if i > 22 { // MAX_FORMAT - 10
 		Errorf(l, "invalid format (too long)")
 	}

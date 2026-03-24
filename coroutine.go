@@ -16,7 +16,7 @@ var coroutineLibrary = []RegistryFunction{
 		co.hasError = false
 		// Reset call info to base (like C Lua)
 		co.callInfo = &co.baseCallInfo
-		co.errorFunction = 0 // clear any xpcall error handler
+		co.errorFunction = 0       // clear any xpcall error handler
 		co.status = threadStatusOK // temporarily OK so __close handlers can run
 		// Close TBC variables in protected mode with error chaining
 		closeErrVal := co.closeTBCProtected(0, nil)
@@ -47,9 +47,9 @@ var coroutineLibrary = []RegistryFunction{
 	{"create", func(l *State) int {
 		CheckType(l, 1, TypeFunction)
 		co := l.NewThread()
-		l.PushValue(1)   // push function
-		XMove(l, co, 1)  // move function to coroutine stack
-		return 1         // return the thread
+		l.PushValue(1)  // push function
+		XMove(l, co, 1) // move function to coroutine stack
+		return 1        // return the thread
 	}},
 	{"resume", coroutineResume},
 	{"yield", func(l *State) int {
@@ -81,8 +81,8 @@ var coroutineLibrary = []RegistryFunction{
 	{"wrap", func(l *State) int {
 		CheckType(l, 1, TypeFunction)
 		l.NewThread()
-		l.PushValue(1)                  // push function
-		XMove(l, l.ToThread(-2), 1)     // move function to coroutine stack
+		l.PushValue(1)              // push function
+		XMove(l, l.ToThread(-2), 1) // move function to coroutine stack
 		l.PushGoClosure(coroutineWrapHelper, 1)
 		return 1
 	}},

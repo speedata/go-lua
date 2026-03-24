@@ -14,13 +14,13 @@ type loadState struct {
 
 // Lua 5.4 header: no IntSize/PointerSize fields
 var header54 struct {
-	Signature                   [4]byte
-	Version, Format             byte
-	Data                        [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
-	InstructionSize             byte
-	IntegerSize, NumberSize     byte
-	TestInt                     int64   // LUAC_INT: 0x5678
-	TestNum                     float64 // LUAC_NUM: 370.5
+	Signature               [4]byte
+	Version, Format         byte
+	Data                    [6]byte // LUAC_DATA: "\x19\x93\r\n\x1a\n"
+	InstructionSize         byte
+	IntegerSize, NumberSize byte
+	TestInt                 int64   // LUAC_INT: 0x5678
+	TestNum                 float64 // LUAC_NUM: 370.5
 }
 
 var (

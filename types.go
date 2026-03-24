@@ -234,7 +234,7 @@ type prototype struct {
 	constants                    []value
 	code                         []instruction
 	prototypes                   []prototype
-	lineInfo                     []int8  // Lua 5.4: relative line info
+	lineInfo                     []int8        // Lua 5.4: relative line info
 	absLineInfos                 []absLineInfo // Lua 5.4: absolute line info
 	localVariables               []localVariable
 	upValues                     []upValueDesc
