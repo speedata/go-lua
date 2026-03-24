@@ -165,7 +165,6 @@ func (d *dumpState) writeLocalVariables(p *prototype) {
 		d.writeString(lv.name)
 		d.writeInt(int(lv.startPC))
 		d.writeInt(int(lv.endPC))
-		d.writeByte(lv.kind) // Lua 5.4: variable kind byte
 	}
 }
 

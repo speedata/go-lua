@@ -461,7 +461,7 @@ func TestLocIsCorrectOnError(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error! Got none... :(")
 	} else {
-		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value" {
+		if err.Error() != "runtime error: [string \"test\"]:3: attempt to perform arithmetic on a nil value (global 'q')" {
 			t.Errorf("Wrong error reported: %v", err)
 		}
 	}

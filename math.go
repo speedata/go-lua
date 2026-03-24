@@ -101,13 +101,16 @@ var mathLibrary = []RegistryFunction{
 		return 1
 	}},
 	{"ceil", func(l *State) int {
-		// Lua 5.3: ceil returns integer when result fits
-		x := CheckNumber(l, 1)
-		c := math.Ceil(x)
-		if i := int64(c); float64(i) == c && c >= float64(math.MinInt64) && c <= float64(math.MaxInt64) {
-			l.PushInteger64(i)
+		if l.IsInteger(1) {
+			l.SetTop(1) // integer is its own ceil
 		} else {
-			l.PushNumber(c)
+			x := CheckNumber(l, 1)
+			c := math.Ceil(x)
+			if i := int64(c); float64(i) == c && c >= float64(math.MinInt64) && c <= float64(math.MaxInt64) {
+				l.PushInteger64(i)
+			} else {
+				l.PushNumber(c)
+			}
 		}
 		return 1
 	}},
@@ -116,13 +119,16 @@ var mathLibrary = []RegistryFunction{
 	{"deg", mathUnaryOp(func(x float64) float64 { return x / radiansPerDegree })},
 	{"exp", mathUnaryOp(math.Exp)},
 	{"floor", func(l *State) int {
-		// Lua 5.3: floor returns integer when result fits
-		x := CheckNumber(l, 1)
-		f := math.Floor(x)
-		if i := int64(f); float64(i) == f && f >= float64(math.MinInt64) && f <= float64(math.MaxInt64) {
-			l.PushInteger64(i)
+		if l.IsInteger(1) {
+			l.SetTop(1) // integer is its own floor
 		} else {
-			l.PushNumber(f)
+			x := CheckNumber(l, 1)
+			f := math.Floor(x)
+			if i := int64(f); float64(i) == f && f >= float64(math.MinInt64) && f <= float64(math.MaxInt64) {
+				l.PushInteger64(i)
+			} else {
+				l.PushNumber(f)
+			}
 		}
 		return 1
 	}},
