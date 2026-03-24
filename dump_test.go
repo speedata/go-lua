@@ -58,6 +58,19 @@ func TestUndumpThenDumpReturnsTheSameFunction(t *testing.T) {
 	}
 }
 
+// clearLocalVarMeta zeros out localVariable fields (kind, val) that are not
+// part of the binary dump format so that DeepEqual comparisons work for
+// dump→undump roundtrips.
+func clearLocalVarMeta(p *prototype) {
+	for i := range p.localVariables {
+		p.localVariables[i].kind = 0
+		p.localVariables[i].val = nil
+	}
+	for i := range p.prototypes {
+		clearLocalVarMeta(&p.prototypes[i])
+	}
+}
+
 func TestDumpThenUndumpReturnsTheSameFunction(t *testing.T) {
 	_, err := exec.LookPath("luac")
 	if err != nil {
@@ -88,6 +101,10 @@ func TestDumpThenUndumpReturnsTheSameFunction(t *testing.T) {
 	if undumpedPrototype == nil {
 		t.Fatal("prototype was nil")
 	}
+
+	// Clear non-serialized fields before comparison: kind and val are
+	// set by the compiler but not included in the Lua 5.4 binary format.
+	clearLocalVarMeta(f.prototype)
 
 	if !reflect.DeepEqual(f.prototype, undumpedPrototype) {
 		t.Errorf("prototypes not the same: %#v %#v", f.prototype, undumpedPrototype)

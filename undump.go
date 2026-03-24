@@ -158,10 +158,6 @@ func (state *loadState) readLocalVariables() (localVariables []localVariable, er
 			return
 		}
 		localVariables[i].endPC = pc(endPC)
-		// Lua 5.4: read variable kind byte
-		if localVariables[i].kind, err = state.readByte(); err != nil {
-			return
-		}
 	}
 	return
 }
