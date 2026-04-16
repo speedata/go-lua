@@ -20,6 +20,9 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Check 32-bit compilation
+        run: GOARCH=386 go vet ./...
+
       - name: Run tests
         run: go test -race -coverprofile=coverage.txt ./...
 

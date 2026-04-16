@@ -323,10 +323,10 @@ func MathOpen(l *State) int {
 	l.SetField(-2, "pi")
 	l.PushNumber(math.Inf(1)) // Lua defines math.huge as infinity
 	l.SetField(-2, "huge")
-	// Lua 5.3: integer limits
-	l.PushInteger(math.MaxInt64)
+	// Lua 5.4: integer limits
+	l.PushInteger64(maxInt64)
 	l.SetField(-2, "maxinteger")
-	l.PushInteger(math.MinInt64)
+	l.PushInteger64(minInt64)
 	l.SetField(-2, "mininteger")
 	return 1
 }
