@@ -3,9 +3,19 @@ package lua
 import (
 	"math"
 	"math/rand"
+	"time"
 )
 
 const radiansPerDegree = math.Pi / 180.0
+
+// rng is the package-local source for math.random / math.randomseed.
+// Go 1.20 turned the top-level rand.Seed into a no-op against the
+// auto-seeded global generator, so Lua's contract that
+// "math.randomseed(N) makes math.random reproducible from N" can only
+// be honoured against a private *rand.Rand. The default seed is the
+// current time, matching Lua 5.4's startup auto-seed behaviour.
+// Not goroutine-safe — same threading model as lua.State itself.
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func mathUnaryOp(f func(float64) float64) Function {
 	return func(l *State) int {
@@ -207,21 +217,21 @@ var mathLibrary = []RegistryFunction{
 			rangeSize := rangeHigh - rangeLow + 1
 			if rangeSize == 0 {
 				// Full 64-bit range (overflow to 0 means 2^64)
-				return int64(rand.Uint64())
+				return int64(rng.Uint64())
 			}
 			// Unbiased: use rejection sampling for large ranges
-			r := rand.Uint64() % rangeSize
+			r := rng.Uint64() % rangeSize
 			return int64(r+rangeLow) + math.MinInt64
 		}
 		switch l.Top() {
 		case 0: // no arguments - returns float in [0,1)
 			// Use exactly 53 bits of randomness, like C Lua 5.4
-			l.PushNumber(float64(rand.Int63()>>10) / float64(int64(1)<<53))
+			l.PushNumber(float64(rng.Int63()>>10) / float64(int64(1)<<53))
 		case 1: // upper limit only - returns integer in [1, u], or full-range for 0
 			u := checkInt64(1)
 			if u == 0 {
 				// Lua 5.4: random(0) returns a full-range random integer
-				l.PushInteger64(int64(rand.Uint64()))
+				l.PushInteger64(int64(rng.Uint64()))
 			} else {
 				ArgumentCheck(l, 1 <= u, 1, "interval is empty")
 				l.PushInteger64(randRange(1, u))
@@ -237,8 +247,8 @@ var mathLibrary = []RegistryFunction{
 		return 1
 	}},
 	{"randomseed", func(l *State) int {
-		rand.Seed(int64(CheckUnsigned(l, 1)))
-		rand.Float64() // discard first value to avoid undesirable correlations
+		rng.Seed(int64(CheckUnsigned(l, 1)))
+		rng.Float64() // discard first value to avoid undesirable correlations
 		return 0
 	}},
 	{"sinh", mathUnaryOp(math.Sinh)},
