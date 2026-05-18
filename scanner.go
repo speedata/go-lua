@@ -275,6 +275,7 @@ func (s *scanner) readHexNumber(x float64) (n float64, c rune, i int, overflow i
 func (s *scanner) readHexFraction() (frac float64, c rune, count int, expAdj int) {
 	c = s.current
 	leadingZeros := 0
+	accumulated := 0
 	gotSignificant := false
 	const maxPrecise = float64(1 << 53)
 
@@ -303,19 +304,18 @@ func (s *scanner) readHexFraction() (frac float64, c rune, count int, expAdj int
 			gotSignificant = true
 		}
 
-		// Accumulate as integer-like value (we'll adjust with exponent)
+		// Accumulate while float64 can still hold another shift+digit losslessly.
+		// Digits beyond that precision contribute bits we couldn't represent
+		// anyway, so we drop them — but we must NOT count them in expAdj, or
+		// the final `frac * 2^expAdj` would shift the accumulated mantissa
+		// too far right.
 		if frac < maxPrecise {
 			frac = frac*16.0 + digit
+			accumulated++
 		}
-		// Digits beyond precision are ignored (they don't affect float64 result)
 	}
-	// The fractional value should be: frac / 16^(count)
-	// But we return frac as accumulated value, with expAdj = -(leadingZeros + digits_accumulated) * 4
-	// Actually simpler: expAdj tells us how many positions to shift
-	// frac * 2^expAdj gives the correct fractional value
 	if gotSignificant {
-		digitsAccumulated := count - leadingZeros
-		expAdj = -(leadingZeros + digitsAccumulated) * 4
+		expAdj = -(leadingZeros + accumulated) * 4
 	}
 	return
 }
