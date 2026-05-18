@@ -1,21 +1,90 @@
 package lua
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"math"
-	"math/rand"
+	"math/bits"
 	"time"
 )
 
 const radiansPerDegree = math.Pi / 180.0
 
-// rng is the package-local source for math.random / math.randomseed.
-// Go 1.20 turned the top-level rand.Seed into a no-op against the
-// auto-seeded global generator, so Lua's contract that
-// "math.randomseed(N) makes math.random reproducible from N" can only
-// be honoured against a private *rand.Rand. The default seed is the
-// current time, matching Lua 5.4's startup auto-seed behaviour.
-// Not goroutine-safe — same threading model as lua.State itself.
-var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+// xoshiro256ss is Lua 5.4's reference PRNG (xoshiro256**), matching the
+// upstream algorithm in lmathlib.c so that seeded streams are bit-identical
+// to PUC-Rio Lua. Not goroutine-safe — same threading model as lua.State.
+type xoshiro256ss struct {
+	s [4]uint64
+}
+
+func (x *xoshiro256ss) next() uint64 {
+	state0 := x.s[0]
+	state1 := x.s[1]
+	state2 := x.s[2] ^ state0
+	state3 := x.s[3] ^ state1
+	res := bits.RotateLeft64(state1*5, 7) * 9
+	x.s[0] = state0 ^ state3
+	x.s[1] = state1 ^ state2
+	x.s[2] = state2 ^ (state1 << 17)
+	x.s[3] = bits.RotateLeft64(state3, 45)
+	return res
+}
+
+// setSeed reproduces lmathlib.c's setseed: scatter (n1, n2) into the four
+// state words and discard 16 outputs to "spread" the seed.
+func (x *xoshiro256ss) setSeed(n1, n2 uint64) {
+	x.s[0] = n1
+	x.s[1] = 0xff
+	x.s[2] = n2
+	x.s[3] = 0
+	for i := 0; i < 16; i++ {
+		x.next()
+	}
+}
+
+// i2float converts a raw 64-bit PRNG output into a float in [0, 1) using
+// the top 53 bits — matches lmathlib.c's I2d for FIGS=53 (double precision).
+func i2float(x uint64) float64 {
+	return float64(x>>11) * (1.0 / float64(uint64(1)<<53))
+}
+
+// project maps a random 64-bit value into [0, n] uniformly via rejection
+// sampling on the smallest 2^k-1 mask covering n. Mirrors lmathlib.c's project.
+func (x *xoshiro256ss) project(ran, n uint64) uint64 {
+	if n&(n+1) == 0 {
+		return ran & n
+	}
+	lim := n
+	lim |= lim >> 1
+	lim |= lim >> 2
+	lim |= lim >> 4
+	lim |= lim >> 8
+	lim |= lim >> 16
+	lim |= lim >> 32
+	for {
+		ran &= lim
+		if ran <= n {
+			return ran
+		}
+		ran = x.next()
+	}
+}
+
+// rng is the package-local PRNG state. Default seed comes from crypto/rand
+// so that an unseeded math.random looks random across runs; users can call
+// math.randomseed(n1, n2) to make the stream reproducible.
+var rng = func() *xoshiro256ss {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// crypto/rand failure: fall back to wall-clock time
+		t := uint64(time.Now().UnixNano())
+		binary.LittleEndian.PutUint64(b[0:8], t)
+		binary.LittleEndian.PutUint64(b[8:16], t^0x9e3779b97f4a7c15)
+	}
+	x := &xoshiro256ss{}
+	x.setSeed(binary.LittleEndian.Uint64(b[0:8]), binary.LittleEndian.Uint64(b[8:16]))
+	return x
+}()
 
 func mathUnaryOp(f func(float64) float64) Function {
 	return func(l *State) int {
@@ -209,47 +278,64 @@ var mathLibrary = []RegistryFunction{
 			}
 			return i
 		}
-		// randRange returns a random int64 in [lo, u] inclusive
-		randRange := func(lo, u int64) int64 {
-			// Use uint64 arithmetic to avoid overflow
-			rangeLow := uint64(lo - math.MinInt64)
-			rangeHigh := uint64(u - math.MinInt64)
-			rangeSize := rangeHigh - rangeLow + 1
-			if rangeSize == 0 {
-				// Full 64-bit range (overflow to 0 means 2^64)
-				return int64(rng.Uint64())
-			}
-			// Unbiased: use rejection sampling for large ranges
-			r := rng.Uint64() % rangeSize
-			return int64(r+rangeLow) + math.MinInt64
-		}
+		// Mirror C Lua: draw one PRNG value, then dispatch on arg count.
+		rv := rng.next()
 		switch l.Top() {
 		case 0: // no arguments - returns float in [0,1)
-			// Use exactly 53 bits of randomness, like C Lua 5.4
-			l.PushNumber(float64(rng.Int63()>>10) / float64(int64(1)<<53))
+			l.PushNumber(i2float(rv))
 		case 1: // upper limit only - returns integer in [1, u], or full-range for 0
 			u := checkInt64(1)
 			if u == 0 {
 				// Lua 5.4: random(0) returns a full-range random integer
-				l.PushInteger64(int64(rng.Uint64()))
+				l.PushInteger64(int64(rv))
 			} else {
 				ArgumentCheck(l, 1 <= u, 1, "interval is empty")
-				l.PushInteger64(randRange(1, u))
+				p := rng.project(rv, uint64(u)-1)
+				l.PushInteger64(int64(p + 1))
 			}
 		case 2: // lower and upper limits - returns integer in [lo, u]
 			lo := checkInt64(1)
 			u := checkInt64(2)
 			ArgumentCheck(l, lo <= u, 2, "interval is empty")
-			l.PushInteger64(randRange(lo, u))
+			p := rng.project(rv, uint64(u)-uint64(lo))
+			l.PushInteger64(int64(p + uint64(lo)))
 		default:
 			Errorf(l, "wrong number of arguments")
 		}
 		return 1
 	}},
 	{"randomseed", func(l *State) int {
-		rng.Seed(int64(CheckUnsigned(l, 1)))
-		rng.Float64() // discard first value to avoid undesirable correlations
-		return 0
+		// Helper to get int64 argument
+		checkInt64 := func(index int) int64 {
+			i, ok := l.ToInteger64(index)
+			if !ok {
+				ArgumentError(l, index, "integer expected")
+			}
+			return i
+		}
+		var n1, n2 uint64
+		if l.IsNone(1) {
+			// 0-arg form: pick a fresh random seed from crypto/rand
+			var b [16]byte
+			if _, err := crand.Read(b[:]); err != nil {
+				t := uint64(time.Now().UnixNano())
+				binary.LittleEndian.PutUint64(b[0:8], t)
+				binary.LittleEndian.PutUint64(b[8:16], t^0x9e3779b97f4a7c15)
+			}
+			n1 = binary.LittleEndian.Uint64(b[0:8])
+			n2 = binary.LittleEndian.Uint64(b[8:16])
+		} else {
+			n1 = uint64(checkInt64(1))
+			if l.IsNoneOrNil(2) {
+				n2 = 0
+			} else {
+				n2 = uint64(checkInt64(2))
+			}
+		}
+		rng.setSeed(n1, n2)
+		l.PushInteger64(int64(n1))
+		l.PushInteger64(int64(n2))
+		return 2
 	}},
 	{"sinh", mathUnaryOp(math.Sinh)},
 	{"sin", mathUnaryOp(math.Sin)},

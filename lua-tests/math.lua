@@ -812,45 +812,45 @@ local function testnear (val, ref, tol)
 end
 
 
--- SKIP (go-lua uses different PRNG): -- low-level!! For the current implementation of random in Lua,
--- SKIP (go-lua uses different PRNG): -- the first call after seed 1007 should return 0x7a7040a5a323c9d6
--- SKIP (go-lua uses different PRNG): do
--- SKIP (go-lua uses different PRNG):   -- all computations should work with 32-bit integers
--- SKIP (go-lua uses different PRNG):   local h <const> = 0x7a7040a5   -- higher half
--- SKIP (go-lua uses different PRNG):   local l <const> = 0xa323c9d6   -- lower half
--- SKIP (go-lua uses different PRNG): 
--- SKIP (go-lua uses different PRNG):   math.randomseed(1007)
--- SKIP (go-lua uses different PRNG):   -- get the low 'intbits' of the 64-bit expected result
--- SKIP (go-lua uses different PRNG):   local res = (h << 32 | l) & ~(~0 << intbits)
--- SKIP (go-lua uses different PRNG):   assert(random(0) == res)
--- SKIP (go-lua uses different PRNG): 
--- SKIP (go-lua uses different PRNG):   math.randomseed(1007, 0)
--- SKIP (go-lua uses different PRNG):   -- using higher bits to generate random floats; (the '% 2^32' converts
--- SKIP (go-lua uses different PRNG):   -- 32-bit integers to floats as unsigned)
--- SKIP (go-lua uses different PRNG):   local res
--- SKIP (go-lua uses different PRNG):   if floatbits <= 32 then
--- SKIP (go-lua uses different PRNG):     -- get all bits from the higher half
--- SKIP (go-lua uses different PRNG):     res = (h >> (32 - floatbits)) % 2^32
--- SKIP (go-lua uses different PRNG):   else
--- SKIP (go-lua uses different PRNG):     -- get 32 bits from the higher half and the rest from the lower half
--- SKIP (go-lua uses different PRNG):     res = (h % 2^32) * 2^(floatbits - 32) + ((l >> (64 - floatbits)) % 2^32)
--- SKIP (go-lua uses different PRNG):   end
--- SKIP (go-lua uses different PRNG):   local rand = random()
--- SKIP (go-lua uses different PRNG):   assert(eq(rand, 0x0.7a7040a5a323c9d6, 2^-floatbits))
--- SKIP (go-lua uses different PRNG):   assert(rand * 2^floatbits == res)
--- SKIP (go-lua uses different PRNG): end
--- SKIP (go-lua uses different PRNG): 
--- SKIP (go-lua uses different PRNG): do
--- SKIP (go-lua uses different PRNG):   -- testing return of 'randomseed'
--- SKIP (go-lua uses different PRNG):   local x, y = math.randomseed()
--- SKIP (go-lua uses different PRNG):   local res = math.random(0)
--- SKIP (go-lua uses different PRNG):   x, y = math.randomseed(x, y)    -- should repeat the state
--- SKIP (go-lua uses different PRNG):   assert(math.random(0) == res)
--- SKIP (go-lua uses different PRNG):   math.randomseed(x, y)    -- again should repeat the state
--- SKIP (go-lua uses different PRNG):   assert(math.random(0) == res)
--- SKIP (go-lua uses different PRNG):   -- keep the random seed for following tests
--- SKIP (go-lua uses different PRNG):   print(string.format("random seeds: %d, %d", x, y))
--- SKIP (go-lua uses different PRNG): end
+-- low-level!! For the current implementation of random in Lua,
+-- the first call after seed 1007 should return 0x7a7040a5a323c9d6
+do
+  -- all computations should work with 32-bit integers
+  local h <const> = 0x7a7040a5   -- higher half
+  local l <const> = 0xa323c9d6   -- lower half
+
+  math.randomseed(1007)
+  -- get the low 'intbits' of the 64-bit expected result
+  local res = (h << 32 | l) & ~(~0 << intbits)
+  assert(random(0) == res)
+
+  math.randomseed(1007, 0)
+  -- using higher bits to generate random floats; (the '% 2^32' converts
+  -- 32-bit integers to floats as unsigned)
+  local res
+  if floatbits <= 32 then
+    -- get all bits from the higher half
+    res = (h >> (32 - floatbits)) % 2^32
+  else
+    -- get 32 bits from the higher half and the rest from the lower half
+    res = (h % 2^32) * 2^(floatbits - 32) + ((l >> (64 - floatbits)) % 2^32)
+  end
+  local rand = random()
+  assert(eq(rand, 0x0.7a7040a5a323c9d6, 2^-floatbits))
+  assert(rand * 2^floatbits == res)
+end
+
+do
+  -- testing return of 'randomseed'
+  local x, y = math.randomseed()
+  local res = math.random(0)
+  x, y = math.randomseed(x, y)    -- should repeat the state
+  assert(math.random(0) == res)
+  math.randomseed(x, y)    -- again should repeat the state
+  assert(math.random(0) == res)
+  -- keep the random seed for following tests
+  print(string.format("random seeds: %d, %d", x, y))
+end
 
 do   -- test random for floats
   local randbits = math.min(floatbits, 64)   -- at most 64 random bits
